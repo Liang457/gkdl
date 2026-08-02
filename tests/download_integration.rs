@@ -205,3 +205,65 @@ async fn interrupted_download_resumes_from_control_file() {
     );
     std::fs::remove_file(&out).ok();
 }
+
+/// 慢服务器路径：/slow 响应前等待 delay_ms，验证下载仍能成功完成
+#[tokio::test]
+async fn slow_server_path_download_completes() {
+    let data = make_data(512 * 1024); // 512 KiB
+                                      // 启动带慢延迟的服务器：/slow 路径响应前等待 200ms
+    let server = TestServer::start_slow(data.clone(), false, 200).await;
+    let out = out_path("slow_path");
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(format!("{}.gkdl", out.display()));
+
+    let config = DownloadConfig {
+        split: 4,
+        min_split_size: 64 * 1024,
+        // 短宽限期以便慢线程检测能快速触发
+        grace_period: 0.5,
+        slow_confirm: 3,
+        ..Default::default()
+    };
+    // 使用 /slow 路径下载
+    let report = engine::download(
+        vec![server.url_slow()],
+        Some(out.clone()),
+        config,
+        None,
+        |_| {},
+    )
+    .await
+    .expect("慢服务器下载失败");
+    assert_eq!(report.total as usize, data.len());
+
+    let written = std::fs::read(&out).expect("读输出文件失败");
+    assert_eq!(written, data, "慢服务器下载内容不一致");
+    std::fs::remove_file(&out).ok();
+}
+
+/// 慢服务器与失败路径混合：验证多源故障转移时慢路径仍能作为备选源
+#[tokio::test]
+async fn slow_server_with_multi_source_failover() {
+    let data = make_data(256 * 1024);
+    let server = TestServer::start_slow(data.clone(), false, 100).await;
+    let out = out_path("slow_failover");
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(format!("{}.gkdl", out.display()));
+
+    let config = DownloadConfig {
+        split: 4,
+        min_split_size: 32 * 1024,
+        grace_period: 0.5,
+        ..Default::default()
+    };
+    // 慢路径作为备选源，失败路径优先
+    let urls = vec![server.fail_url(), server.url_slow(), server.url()];
+    let report = engine::download(urls, Some(out.clone()), config, None, |_| {})
+        .await
+        .expect("多源慢服务器下载失败");
+    assert_eq!(report.total as usize, data.len());
+
+    let written = std::fs::read(&out).unwrap();
+    assert_eq!(written, data, "多源慢服务器下载内容不一致");
+    std::fs::remove_file(&out).ok();
+}

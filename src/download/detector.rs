@@ -147,4 +147,137 @@ mod tests {
         let seg = make_seg(0, &[1000.0; 6]);
         assert_eq!(det.evaluate(0, &seg, &[]), Verdict::Healthy);
     }
+
+    /// 速度 < 中位数 30% 时，连续 3 次确认后应返回 Kill
+    #[test]
+    fn slow_below_30_percent_median_killed_after_3_confirms() {
+        let config = DownloadConfig {
+            grace_period: 0.0, // 取消宽限期
+            ..Default::default()
+        };
+        let mut det = SlowThreadDetector::new(&config);
+        det.register(0);
+        det.register(1);
+        // 将 birth_time 设到过去，跳过宽限期
+        det.birth_time
+            .insert(0, Instant::now() - Duration::from_secs(10));
+        det.birth_time
+            .insert(1, Instant::now() - Duration::from_secs(10));
+
+        // worker 0 速度 10，worker 1 速度 1000
+        // 中位数 = 1000，阈值 = 300，10 < 300 → 慢
+        let slow_peer = make_seg(1, &[1000.0; 6]);
+        let mut my_seg = make_seg(0, &[10.0; 6]);
+        my_seg.owner_id = 0;
+        let peers = vec![&slow_peer];
+
+        // 前 2 次应为 Warning（未达到 confirm_count=3）
+        let v1 = det.evaluate(0, &my_seg, &peers);
+        assert_eq!(v1, Verdict::Warning, "第 1 次应为 Warning");
+        let v2 = det.evaluate(0, &my_seg, &peers);
+        assert_eq!(v2, Verdict::Warning, "第 2 次应为 Warning");
+        // 第 3 次应触发 Kill（p10 也低于阈值）
+        let v3 = det.evaluate(0, &my_seg, &peers);
+        assert_eq!(v3, Verdict::Kill, "第 3 次应为 Kill");
+    }
+
+    /// 速度恢复到阈值以上后，strike 计数应重置
+    #[test]
+    fn recovery_resets_strikes() {
+        let config = DownloadConfig {
+            grace_period: 0.0,
+            ..Default::default()
+        };
+        let mut det = SlowThreadDetector::new(&config);
+        det.register(0);
+        det.register(1);
+        det.birth_time
+            .insert(0, Instant::now() - Duration::from_secs(10));
+        det.birth_time
+            .insert(1, Instant::now() - Duration::from_secs(10));
+
+        let fast_peer = make_seg(1, &[1000.0; 6]);
+        let peers = vec![&fast_peer];
+
+        // 先慢 2 次（Warning）
+        let mut slow_seg = make_seg(0, &[10.0; 6]);
+        slow_seg.owner_id = 0;
+        det.evaluate(0, &slow_seg, &peers);
+        det.evaluate(0, &slow_seg, &peers);
+
+        // 速度恢复，应重置 strike
+        let mut fast_seg = make_seg(0, &[5000.0; 6]);
+        fast_seg.owner_id = 0;
+        let v = det.evaluate(0, &fast_seg, &peers);
+        assert_eq!(v, Verdict::Healthy, "恢复后应为 Healthy");
+
+        // 再次变慢，strike 从 0 开始，应又是 Warning 而非 Kill
+        let mut slow_seg2 = make_seg(0, &[10.0; 6]);
+        slow_seg2.owner_id = 0;
+        let v2 = det.evaluate(0, &slow_seg2, &peers);
+        assert_eq!(v2, Verdict::Warning, "重置后第 1 次应为 Warning");
+    }
+
+    /// 样本不足时不应判定为慢
+    #[test]
+    fn insufficient_samples_stays_healthy() {
+        let config = DownloadConfig {
+            grace_period: 0.0,
+            slow_min_samples: 6,
+            ..Default::default()
+        };
+        let mut det = SlowThreadDetector::new(&config);
+        det.register(0);
+        det.birth_time
+            .insert(0, Instant::now() - Duration::from_secs(10));
+
+        // 只有 3 个样本，不足 min_samples=6
+        let mut seg = make_seg(0, &[1.0; 3]); // 极慢但样本不足
+        seg.owner_id = 0;
+        let fast_peer = make_seg(1, &[1000.0; 6]);
+        let peers = vec![&fast_peer];
+        assert_eq!(det.evaluate(0, &seg, &peers), Verdict::Healthy);
+    }
+
+    /// 没有对等节点时不应判定为慢
+    #[test]
+    fn no_peers_stays_healthy() {
+        let config = DownloadConfig {
+            grace_period: 0.0,
+            ..Default::default()
+        };
+        let mut det = SlowThreadDetector::new(&config);
+        det.register(0);
+        det.birth_time
+            .insert(0, Instant::now() - Duration::from_secs(10));
+
+        let mut seg = make_seg(0, &[1.0; 6]); // 极慢但无对等
+        seg.owner_id = 0;
+        assert_eq!(det.evaluate(0, &seg, &[]), Verdict::Healthy);
+    }
+
+    /// 速度恰好等于阈值时应为 Healthy（>= threshold）
+    #[test]
+    fn speed_exactly_at_threshold_is_healthy() {
+        let config = DownloadConfig {
+            grace_period: 0.0,
+            slow_ratio: 0.3,
+            ..Default::default()
+        };
+        let mut det = SlowThreadDetector::new(&config);
+        det.register(0);
+        det.register(1);
+        det.birth_time
+            .insert(0, Instant::now() - Duration::from_secs(10));
+        det.birth_time
+            .insert(1, Instant::now() - Duration::from_secs(10));
+
+        // peer 速度 1000，阈值 = 300
+        let peer = make_seg(1, &[1000.0; 6]);
+        // worker 速度恰好 300 = threshold
+        let mut seg = make_seg(0, &[300.0; 6]);
+        seg.owner_id = 0;
+        let peers = vec![&peer];
+        assert_eq!(det.evaluate(0, &seg, &peers), Verdict::Healthy);
+    }
 }
