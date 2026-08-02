@@ -437,4 +437,107 @@ mod tests {
         let stolen = WorkStealingScheduler::steal_locked(&mut segs, 1, &config, 1);
         assert!(stolen.is_none());
     }
+
+    #[test]
+    fn steal_picks_slowest_segment() {
+        let config = cfg();
+        // 两个下载中的段：seg0 快（速度 1000），seg1 慢（速度 10）
+        let mut segs = vec![
+            Segment::new(0, 0, 200_000, 20),
+            Segment::new(1, 200_000, 400_000, 20),
+        ];
+        segs[0].owner_id = 0;
+        segs[0].state = SegmentState::Downloading;
+        for _ in 0..6 {
+            segs[0].record_speed(1000.0);
+        }
+        segs[1].owner_id = 1;
+        segs[1].state = SegmentState::Downloading;
+        for _ in 0..6 {
+            segs[1].record_speed(10.0);
+        }
+        // worker 2 来窃取，应从最慢的 seg1 切
+        let stolen = WorkStealingScheduler::steal_locked(&mut segs, 2, &config, 10).unwrap();
+        // 窃取的段来自 seg1 的尾部
+        assert_eq!(stolen.end, 400_000);
+        assert!(stolen.start > 200_000, "窃取起点应在 seg1 范围内");
+        // seg1 被截短
+        assert_eq!(segs[1].end, stolen.start);
+    }
+
+    #[test]
+    fn steal_ratio_is_40_percent() {
+        let config = cfg();
+        let mut segs = vec![Segment::new(0, 0, 100_000, 20)];
+        segs[0].owner_id = 0;
+        segs[0].state = SegmentState::Downloading;
+        segs[0].written = 0;
+        // remaining = 100_000, cut = 40_000, cut_point = 60_000
+        let stolen = WorkStealingScheduler::steal_locked(&mut segs, 1, &config, 1).unwrap();
+        assert_eq!(stolen.start, 60_000);
+        assert_eq!(stolen.end, 100_000);
+        assert_eq!(segs[0].end, 60_000);
+        // 窃取量 = 40% of remaining
+        let expected_cut = (100_000.0 * 0.4) as u64;
+        assert_eq!(stolen.end - stolen.start, expected_cut);
+    }
+
+    #[test]
+    fn no_steal_from_own_segment() {
+        let config = cfg();
+        let mut segs = vec![Segment::new(0, 0, 200_000, 20)];
+        segs[0].owner_id = 0;
+        segs[0].state = SegmentState::Downloading;
+        for _ in 0..6 {
+            segs[0].record_speed(10.0);
+        }
+        // worker 0 不能从自己的段窃取
+        let stolen = WorkStealingScheduler::steal_locked(&mut segs, 0, &config, 1);
+        assert!(stolen.is_none());
+    }
+
+    #[test]
+    fn no_steal_from_pending_or_complete() {
+        let config = cfg();
+        let mut segs = vec![
+            Segment::new(0, 0, 200_000, 20),
+            Segment::new(1, 200_000, 400_000, 20),
+        ];
+        // seg0 是 Pending，seg1 是 Complete
+        segs[0].owner_id = 0;
+        segs[0].state = SegmentState::Pending;
+        segs[1].owner_id = 1;
+        segs[1].state = SegmentState::Complete;
+        // 没有 Downloading 段可窃取
+        let stolen = WorkStealingScheduler::steal_locked(&mut segs, 2, &config, 10);
+        assert!(stolen.is_none());
+    }
+
+    #[test]
+    fn find_slowest_returns_lowest_speed() {
+        let config = cfg();
+        let mut segs = vec![
+            Segment::new(0, 0, 200_000, 20),
+            Segment::new(1, 200_000, 400_000, 20),
+            Segment::new(2, 400_000, 600_000, 20),
+        ];
+        segs[0].owner_id = 0;
+        segs[0].state = SegmentState::Downloading;
+        for _ in 0..6 {
+            segs[0].record_speed(500.0);
+        }
+        segs[1].owner_id = 1;
+        segs[1].state = SegmentState::Downloading;
+        for _ in 0..6 {
+            segs[1].record_speed(50.0);
+        }
+        segs[2].owner_id = 2;
+        segs[2].state = SegmentState::Downloading;
+        for _ in 0..6 {
+            segs[2].record_speed(200.0);
+        }
+        // worker 3 来查找最慢段，应返回 seg1（速度 50）
+        let idx = WorkStealingScheduler::find_slowest(&segs, 3, &config).unwrap();
+        assert_eq!(idx, 1);
+    }
 }

@@ -8,6 +8,8 @@ Rust async (tokio) multi-threaded downloader with an aria2/AriaNg-compatible JSO
 - Typecheck: `cargo check --all-targets`
 - Test: `cargo test` (all pass in ~5s; no filter needed)
 - Single test: `cargo test rate_limit_slows_download`
+- Format check: `cargo fmt --check`
+- Lint check: `cargo clippy --all-targets -- -D warnings`
 - No lint/fmt config exists; keep to default `cargo fmt`/clippy.
 
 ## Architecture
