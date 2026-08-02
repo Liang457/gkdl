@@ -264,6 +264,9 @@ async fn run_daemon(args: DaemonArgs) -> i32 {
         piece_length: download_cfg.piece_length,
         max_overall_download_limit: download_cfg.rate_limit,
         max_concurrent_downloads: download_cfg.max_concurrent_downloads,
+        user_agent: download_cfg.user_agent.clone(),
+        referer: download_cfg.referer.clone(),
+        header: download_cfg.header.clone(),
         dir: if download_cfg.dir.is_empty() {
             std::path::PathBuf::from(".")
         } else {

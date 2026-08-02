@@ -47,6 +47,9 @@ fn sync_global_to_config(cfg: &mut crate::config::Config, g: &GlobalOptions) {
     cfg.download.rate_limit = g.max_overall_download_limit;
     cfg.download.max_concurrent_downloads = g.max_concurrent_downloads;
     cfg.download.dir = g.dir.display().to_string();
+    cfg.download.user_agent = g.user_agent.clone();
+    cfg.download.referer = g.referer.clone();
+    cfg.download.header = g.header.clone();
 }
 
 /// 解析 aria2 大小写法：裸数字或带 K/M/G 后缀（1024 进制，大小写不敏感）。
@@ -69,6 +72,18 @@ fn parse_bool(s: &str) -> Option<bool> {
         "true" => Some(true),
         "false" => Some(false),
         _ => None,
+    }
+}
+
+/// 解析 aria2 的 `header` 选项：数组或单个字符串，均为 `NAME: value`。
+fn header_list(v: &Value) -> Vec<String> {
+    match v {
+        Value::Array(a) => a
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect(),
+        Value::String(s) => vec![s.clone()],
+        _ => Vec::new(),
     }
 }
 
@@ -282,6 +297,9 @@ async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> R
                 "piece-length": str_num(global.piece_length),
                 "dir": global.dir.display().to_string(),
                 "save-session": str_bool(global.save_session),
+                "user-agent": global.user_agent.clone(),
+                "referer": global.referer.clone(),
+                "header": global.header.clone(),
             }))
         }
 
@@ -342,6 +360,21 @@ async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> R
             }
             if let Some(v) = opts.get("save-session") {
                 global.save_session = v.as_str().and_then(parse_bool).unwrap_or(false);
+            }
+            if let Some(v) = opts.get("user-agent") {
+                if let Some(s) = v.as_str() {
+                    if !s.trim().is_empty() {
+                        global.user_agent = s.trim().to_string();
+                    }
+                }
+            }
+            if let Some(v) = opts.get("referer") {
+                if let Some(s) = v.as_str() {
+                    global.referer = s.trim().to_string();
+                }
+            }
+            if let Some(v) = opts.get("header") {
+                global.header = header_list(v);
             }
             // 其余不支持/未知选项静默忽略（与 aria2 一致）
 
@@ -438,6 +471,9 @@ async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> R
                 max_retries: global.retries,
                 timeout: global.timeout,
                 piece_length: global.piece_length,
+                user_agent: global.user_agent.clone(),
+                referer: global.referer.clone(),
+                header: global.header.clone(),
                 ..Default::default()
             };
             let mut out_path: Option<PathBuf> = None;
@@ -481,6 +517,22 @@ async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> R
                         if n > 0 {
                             config.piece_length = n;
                         }
+                    }
+                }
+                if let Some(s) = opts.get("user-agent").and_then(|v| v.as_str()) {
+                    if !s.trim().is_empty() {
+                        config.user_agent = s.trim().to_string();
+                    }
+                }
+                if let Some(s) = opts.get("referer").and_then(|v| v.as_str()) {
+                    if !s.trim().is_empty() {
+                        config.referer = s.trim().to_string();
+                    }
+                }
+                if let Some(h) = opts.get("header") {
+                    let list = header_list(h);
+                    if !list.is_empty() {
+                        config.header = list;
                     }
                 }
             }

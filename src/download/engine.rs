@@ -226,8 +226,38 @@ fn hex_val(b: u8) -> Option<u8> {
 }
 
 fn build_client(config: &DownloadConfig) -> Result<Client> {
-    Client::builder()
-        .user_agent(format!("gkdl/{}", env!("CARGO_PKG_VERSION")))
+    let ua = if config.user_agent.trim().is_empty() {
+        crate::download::config::default_user_agent()
+    } else {
+        config.user_agent.clone()
+    };
+    let mut builder = Client::builder().user_agent(ua);
+    if !config.referer.trim().is_empty() || !config.header.is_empty() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if !config.referer.trim().is_empty() {
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(config.referer.trim()) {
+                headers.insert(reqwest::header::REFERER, v);
+            }
+        }
+        for h in &config.header {
+            let Some((name, value)) = h.split_once(':') else {
+                tracing::warn!("忽略无效的请求头（缺少冒号）: {h}");
+                continue;
+            };
+            let name = name.trim();
+            let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
+                tracing::warn!("忽略无效的请求头名称: {h}");
+                continue;
+            };
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(value.trim()) {
+                headers.append(name, v);
+            } else {
+                tracing::warn!("忽略无效的请求头值: {h}");
+            }
+        }
+        builder = builder.default_headers(headers);
+    }
+    builder
         // 不能用总超时（timeout）：那会在 30s 掐断所有耗时更长的下载。
         // 改用 read_timeout（每次成功读后重置），只检测停滞的连接。
         .read_timeout(Duration::from_secs(config.timeout.max(5)))

@@ -847,3 +847,181 @@ async fn max_concurrent_downloads_limits_concurrency() {
     let _ = std::fs::remove_file(format!("{}.gkdl", out1.display()));
     let _ = std::fs::remove_file(format!("{}.gkdl", out2.display()));
 }
+
+#[tokio::test]
+async fn add_uri_sets_custom_user_agent() {
+    let data: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+    let server = TestServer::start(data, false).await;
+    let out = out_path("ua_custom");
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(format!("{}.gkdl", out.display()));
+
+    let (base, mgr, _shutdown, _rx) = start_server("").await;
+    let gid = add_uri_with_opts(
+        &base,
+        &server.url(),
+        &out,
+        serde_json::json!({ "user-agent": "MyCustomUA/1.0" }),
+    )
+    .await;
+    mgr.wait_finished(&gid).await.expect("任务失败");
+
+    let uas = server.user_agents().await;
+    assert!(
+        uas.iter().any(|u| u == "MyCustomUA/1.0"),
+        "服务器应收到自定义 UA，实际: {uas:?}"
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(format!("{}.gkdl", out.display()));
+}
+
+#[tokio::test]
+async fn add_uri_applies_referer_and_custom_headers() {
+    let data: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+    let server = TestServer::start(data, false).await;
+    let out = out_path("headers");
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(format!("{}.gkdl", out.display()));
+
+    let (base, mgr, _shutdown, _rx) = start_server("").await;
+    let gid = add_uri_with_opts(
+        &base,
+        &server.url(),
+        &out,
+        serde_json::json!({
+            "referer": "https://example.com/video/1",
+            "header": ["X-Test-Header: hello", "Origin: https://example.com"]
+        }),
+    )
+    .await;
+    mgr.wait_finished(&gid).await.expect("任务失败");
+
+    let refs = server.request_headers("referer").await;
+    assert!(
+        refs.iter().any(|r| r == "https://example.com/video/1"),
+        "服务器应收到 referer，实际: {refs:?}"
+    );
+    let xt = server.request_headers("x-test-header").await;
+    assert!(
+        xt.iter().any(|v| v == "hello"),
+        "服务器应收到自定义 header，实际: {xt:?}"
+    );
+    let origin = server.request_headers("origin").await;
+    assert!(
+        origin.iter().any(|v| v == "https://example.com"),
+        "服务器应收到自定义 Origin 头，实际: {origin:?}"
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(format!("{}.gkdl", out.display()));
+}
+
+#[tokio::test]
+async fn add_uri_defaults_to_browser_user_agent() {
+    let data: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+    let server = TestServer::start(data, false).await;
+    let out = out_path("ua_default");
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(format!("{}.gkdl", out.display()));
+
+    let (base, mgr, _shutdown, _rx) = start_server("").await;
+    let gid = add_uri_with_opts(&base, &server.url(), &out, serde_json::json!({})).await;
+    mgr.wait_finished(&gid).await.expect("任务失败");
+
+    let expected = gkdl::download::config::default_user_agent();
+    let uas = server.user_agents().await;
+    assert!(
+        uas.iter().any(|u| u == &expected),
+        "服务器应收到默认浏览器 UA，实际: {uas:?}"
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(format!("{}.gkdl", out.display()));
+}
+
+#[tokio::test]
+async fn get_jsonp_base64_params_are_recognized() {
+    // AriaNg 的 GET 请求格式：params 是 base64 编码的 JSON 数组
+    let data: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+    let server = TestServer::start(data, false).await;
+    let out = out_path("jsonp_cjk");
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(format!("{}.gkdl", out.display()));
+
+    let (base, mgr, _shutdown, _rx) = start_server("").await;
+
+    // 复刻用户给出的载荷：含 CJK 文件名、自定义 UA、referer
+    let out_name = "《蔚蓝档案》3rd PV.mp4";
+    let out_path = std::env::temp_dir().join("gkdl_it").join(out_name);
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file(format!("{}.gkdl", out_path.display()));
+    let json = serde_json::json!([
+        [server.url()],
+        {
+            "dir": std::env::temp_dir().join("gkdl_it").display().to_string(),
+            "referer": "https://example.com/video/1",
+            "user-agent": "Mozilla/5.0 Custom/1.0",
+            "out": out_name
+        }
+    ]);
+    let b64 = base64_encode(json.to_string().as_bytes());
+    let id = "《蔚蓝档案》3rd PV.mp4";
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/jsonrpc"))
+        .query(&[("method", "aria2.addUri"), ("id", id), ("params", &b64)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    let gid = v["result"].as_str().expect("GET addUri 应返回 gid");
+    assert_eq!(v["id"].as_str(), Some(id), "id 应原样回显");
+
+    mgr.wait_finished(gid).await.expect("任务失败");
+    assert!(out_path.exists(), "out 选项应生效: {}", out_path.display());
+
+    // 自定义 UA 生效
+    let uas = server.user_agents().await;
+    assert!(
+        uas.iter().any(|u| u == "Mozilla/5.0 Custom/1.0"),
+        "服务器应收到 GET 中 user-agent，实际: {uas:?}"
+    );
+
+    // referer 选项应作为 Referer 请求头发送
+    let refs = server.request_headers("referer").await;
+    assert!(
+        refs.iter().any(|r| r == "https://example.com/video/1"),
+        "服务器应收到 referer，实际: {refs:?}"
+    );
+
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file(format!("{}.gkdl", out_path.display()));
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(format!("{}.gkdl", out.display()));
+}
+
+/// 测试用 base64 编码（标准字母表，兼容 b64decode）。
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}

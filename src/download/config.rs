@@ -51,6 +51,15 @@ pub struct DownloadConfig {
     /// 默认下载目录，空表示当前目录
     #[serde(default)]
     pub dir: String,
+    /// 请求 User-Agent，空则使用默认浏览器 UA
+    #[serde(default = "default_user_agent")]
+    pub user_agent: String,
+    /// Referer 请求头，空则不发送
+    #[serde(default)]
+    pub referer: String,
+    /// 附加请求头（`NAME: value` 列表），随每个请求发送
+    #[serde(default)]
+    pub header: Vec<String>,
 }
 
 fn default_split() -> usize {
@@ -93,6 +102,11 @@ fn default_piece_length() -> u64 {
     1024 * 1024
 }
 
+/// 默认 User-Agent：Firefox 浏览器 UA（公开给 engine 作空值兜底）。
+pub fn default_user_agent() -> String {
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:154.0) Gecko/20100101 Firefox/154.0".into()
+}
+
 impl Default for DownloadConfig {
     fn default() -> Self {
         Self {
@@ -112,6 +126,9 @@ impl Default for DownloadConfig {
             piece_length: default_piece_length(),
             max_concurrent_downloads: 0,
             dir: String::new(),
+            user_agent: default_user_agent(),
+            referer: String::new(),
+            header: Vec::new(),
         }
     }
 }

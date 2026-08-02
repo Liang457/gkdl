@@ -1,5 +1,6 @@
 //! 本地测试 HTTP 服务器：支持 Range、可配置失败路径、可忽略 Range。
 #![allow(dead_code)]
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -12,6 +13,8 @@ pub struct TestServer {
     ignore_range: bool,
     /// `/slow` 路径响应前等待的毫秒数（用于制造慢探测）
     slow_ms: u64,
+    /// 收到的请求头（小写名 → 值列表，按请求先后），用于断言 UA/Referer/自定义头生效
+    headers: Arc<Mutex<HashMap<String, Vec<String>>>>,
     _guard: Mutex<()>,
 }
 
@@ -27,8 +30,10 @@ impl TestServer {
         let addr = listener.local_addr().unwrap().to_string();
         let data = Arc::new(data);
         let fail_paths = Arc::new(vec!["/fail".to_string(), "/broken".to_string()]);
+        let headers = Arc::new(Mutex::new(HashMap::new()));
         let server_data = Arc::clone(&data);
         let server_fail = Arc::clone(&fail_paths);
+        let server_headers = Arc::clone(&headers);
 
         tokio::spawn(async move {
             loop {
@@ -38,8 +43,9 @@ impl TestServer {
                 };
                 let data = Arc::clone(&server_data);
                 let fail = Arc::clone(&server_fail);
+                let headers = Arc::clone(&server_headers);
                 tokio::spawn(async move {
-                    handle_conn(socket, data, fail, ignore_range, delay_ms).await;
+                    handle_conn(socket, data, fail, headers, ignore_range, delay_ms).await;
                 });
             }
         });
@@ -50,8 +56,24 @@ impl TestServer {
             fail_paths,
             ignore_range,
             slow_ms: delay_ms,
+            headers,
             _guard: Mutex::new(()),
         }
+    }
+
+    /// 服务器已收到的 User-Agent 头（按请求先后）。
+    pub async fn user_agents(&self) -> Vec<String> {
+        self.request_headers("user-agent").await
+    }
+
+    /// 服务器已收到指定请求头（名不区分大小写）的所有值。
+    pub async fn request_headers(&self, name: &str) -> Vec<String> {
+        self.headers
+            .lock()
+            .await
+            .get(&name.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn url(&self) -> String {
@@ -76,6 +98,7 @@ async fn handle_conn(
     mut socket: TcpStream,
     data: Arc<Vec<u8>>,
     fail_paths: Arc<Vec<String>>,
+    headers: Arc<Mutex<HashMap<String, Vec<String>>>>,
     ignore_range: bool,
     slow_ms: u64,
 ) {
@@ -140,6 +163,22 @@ async fn handle_conn(
             if let Some(r) = parse_range(value, data.len() as u64) {
                 range = Some(r);
             }
+        }
+    }
+
+    // 记录请求头（小写名 → 值），用于断言 UA/Referer/自定义头生效
+    let mut seen: HashMap<String, Vec<String>> = HashMap::new();
+    for line in req.lines().skip(1) {
+        if let Some((name, value)) = line.split_once(':') {
+            seen.entry(name.trim().to_ascii_lowercase())
+                .or_default()
+                .push(value.trim().to_string());
+        }
+    }
+    {
+        let mut store = headers.lock().await;
+        for (k, vs) in seen {
+            store.entry(k).or_default().extend(vs);
         }
     }
 

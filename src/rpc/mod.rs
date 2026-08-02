@@ -39,6 +39,9 @@ pub struct GlobalOptions {
     pub dir: PathBuf,
     pub save_session: bool,
     pub piece_length: u64,
+    pub user_agent: String,
+    pub referer: String,
+    pub header: Vec<String>,
 }
 
 impl Default for GlobalOptions {
@@ -53,6 +56,9 @@ impl Default for GlobalOptions {
             dir: PathBuf::from("."),
             save_session: false,
             piece_length: 1024 * 1024,
+            user_agent: crate::download::config::default_user_agent(),
+            referer: String::new(),
+            header: Vec::new(),
         }
     }
 }
