@@ -1,0 +1,10 @@
+/target
+
+# 运行时产物
+*.dll
+file.bin
+*.gkdl
+*.gkdl.tmp
+
+# 日志目录
+logs/

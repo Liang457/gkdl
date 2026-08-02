@@ -1,0 +1,60 @@
+pub mod methods;
+pub mod protocol;
+pub mod server;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownKind {
+    Graceful,
+    Force,
+}
+
+#[derive(Clone)]
+pub struct ShutdownHandle {
+    tx: mpsc::UnboundedSender<ShutdownKind>,
+}
+
+impl ShutdownHandle {
+    pub fn new(tx: mpsc::UnboundedSender<ShutdownKind>) -> Self {
+        Self { tx }
+    }
+
+    pub fn request(&self, kind: ShutdownKind) {
+        let _ = self.tx.send(kind);
+    }
+}
+
+/// 全局选项（可运行时修改）。
+#[derive(Debug, Clone)]
+pub struct GlobalOptions {
+    pub max_overall_download_limit: u64,
+    pub max_concurrent_downloads: usize,
+    pub split: usize,
+    pub min_split_size: u64,
+    pub retries: u32,
+    pub timeout: u64,
+    pub dir: PathBuf,
+    pub save_session: bool,
+    pub piece_length: u64,
+}
+
+impl Default for GlobalOptions {
+    fn default() -> Self {
+        Self {
+            max_overall_download_limit: 0,
+            max_concurrent_downloads: 0,
+            split: 8,
+            min_split_size: 256 * 1024,
+            retries: 3,
+            timeout: 30,
+            dir: PathBuf::from("."),
+            save_session: false,
+            piece_length: 1024 * 1024,
+        }
+    }
+}
+
+pub type GlobalOptionsRef = Arc<Mutex<GlobalOptions>>;
