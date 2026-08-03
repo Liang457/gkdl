@@ -237,8 +237,6 @@ async fn tell_status(task: &Arc<Task>) -> Value {
         "pieceLength": str_num(piece_length),
         "numPieces": str_num(num_pieces),
         "bitfield": bitfield,
-        "verifiedLength": str_num(completed),
-        "verifyIntegrityPending": "false",
         "errorCode": str_num(error_code as u64),
         "errorMessage": error_message,
         "followedBy": [],
@@ -881,6 +879,10 @@ mod tests {
         assert_eq!(obj["pieceLength"], json!("0"));
         assert_eq!(obj["numPieces"], json!("0"));
         assert_eq!(obj["bitfield"], json!(""));
+        // 与 aria2 一致：无完整性校验进行时不返回校验相关字段，
+        // 否则 AriaNg 会误判任务为"等待验证"而不显示下载速度
+        assert!(obj.get("verifiedLength").is_none());
+        assert!(obj.get("verifyIntegrityPending").is_none());
     }
 
     #[test]
