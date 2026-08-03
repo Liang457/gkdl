@@ -114,7 +114,7 @@ impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("读取配置文件失败: {}", path.display()))?;
-        let cfg: Config = serde_yml::from_str(&content).context("解析配置文件失败")?;
+        let cfg: Config = yaml_serde::from_str(&content).context("解析配置文件失败")?;
         Ok(cfg)
     }
 
@@ -122,7 +122,7 @@ impl Config {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let yaml = serde_yml::to_string(self).context("序列化配置失败")?;
+        let yaml = yaml_serde::to_string(self).context("序列化配置失败")?;
         std::fs::write(path, yaml)
             .with_context(|| format!("写配置文件失败: {}", path.display()))?;
         Ok(())
@@ -157,7 +157,7 @@ mod tests {
     }
 
     #[test]
-    fn serde_yml_parses() {
+    fn yaml_serde_parses() {
         let yaml = r#"
 daemon:
   host: 0.0.0.0
@@ -171,7 +171,7 @@ log:
 hook:
   commands_file: "C:/x/hooks.txt"
 "#;
-        let cfg: Config = serde_yml::from_str(yaml).unwrap();
+        let cfg: Config = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(cfg.daemon.host, "0.0.0.0");
         assert_eq!(cfg.daemon.port, 6801);
         assert_eq!(cfg.daemon.rpc_secret, "abc");

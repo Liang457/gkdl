@@ -3,7 +3,7 @@ use crate::download::engine::{self, Progress};
 use crate::download::resume::ResumeState;
 use crate::hooks::{self, HookConfig, HookContext};
 use anyhow::{anyhow, bail, Result};
-use rand::Rng;
+use rand::RngExt;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
@@ -225,9 +225,9 @@ impl TaskManager {
     }
 
     pub fn gen_gid() -> String {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         (0..16)
-            .map(|_| format!("{:x}", rng.gen_range(0..16)))
+            .map(|_| format!("{:x}", rng.random_range(0..16)))
             .collect()
     }
 
