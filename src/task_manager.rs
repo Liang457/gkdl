@@ -293,7 +293,11 @@ impl TaskManager {
                     return;
                 }
                 if *task_for_driver.status.lock().unwrap() == TaskStatus::Paused {
-                    task_for_driver.resume_notify.notified().await;
+                    // 排队中被暂停：等待 unpause；同时监听取消/删除，防止永久挂起
+                    tokio::select! {
+                        _ = task_for_driver.resume_notify.notified() => {}
+                        _ = task_for_driver.task_token.cancelled() => return,
+                    }
                     continue;
                 }
                 let Some(p) = mgr.gate.acquire(&task_for_driver.task_token).await else {
@@ -403,6 +407,15 @@ impl TaskManager {
             // 任务已被移除：清理控制文件与部分文件
             if *task_for_driver.status.lock().unwrap() == TaskStatus::Removed {
                 mgr.cleanup_incomplete_files(&task_for_driver);
+            }
+
+            // 终态：释放调度器内的速度历史等临时内存（保留段表供 tellStatus 展示）
+            let sched = {
+                let guard = task_for_driver.scheduler.lock().unwrap();
+                guard.as_ref().map(Arc::clone)
+            };
+            if let Some(sched) = sched {
+                sched.trim().await;
             }
         });
         *task.driver.lock().unwrap() = Some(driver);
@@ -532,6 +545,7 @@ impl TaskManager {
         }
         // 取消排队中的 driver 与运行中的引擎
         task.task_token.cancel();
+        task.resume_notify.notify_one(); // 唤醒排队中被暂停阻塞的 driver，避免其永久挂起
         if let Some(ct) = task.cancel_token.lock().unwrap().as_ref() {
             ct.cancel();
         }

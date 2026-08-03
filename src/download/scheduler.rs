@@ -355,6 +355,17 @@ impl WorkStealingScheduler {
             self.complete_notify.notified().await;
         }
     }
+
+    /// 终态清理：清空各段速度历史并收缩段表容量，释放工作窃取期间积累的临时内存。
+    /// 段的区间/进度/状态信息保留，供 tellStatus 的 bitfield 展示使用。
+    pub async fn trim(&self) {
+        let mut guard = self.segments.lock().await;
+        for s in guard.iter_mut() {
+            s.clear_speed();
+            s.speed_history.shrink_to_fit();
+        }
+        guard.shrink_to_fit();
+    }
 }
 
 #[cfg(test)]

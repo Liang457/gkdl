@@ -848,6 +848,95 @@ async fn max_concurrent_downloads_limits_concurrency() {
     let _ = std::fs::remove_file(format!("{}.gkdl", out2.display()));
 }
 
+/// 回归测试：排队中被暂停的任务被删除后，driver 应立即退出而非永久挂起。
+/// 之前 remove() 不通知 resume_notify，driver 卡在 notified().await 泄漏 Arc<Task>。
+///
+/// 时序：gid1 慢下载占住槽位 → gid2 进入 waiting → pause(gid2) 使其 Paused。
+/// gid1 完成后 gid2 抢到槽位但发现已暂停，于是 driver 阻塞在 resume_notify 等待；
+/// 此时 remove(gid2) 必须能唤醒 driver 使其退出（否则 is_finished() 永远为 false）。
+#[tokio::test]
+async fn removing_paused_queued_task_does_not_hang_driver() {
+    let data: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
+    let server = TestServer::start(data, false).await;
+    let out1 = out_path("hang_conc1");
+    let out2 = out_path("hang_conc2");
+    let _ = std::fs::remove_file(&out1);
+    let _ = std::fs::remove_file(&out2);
+    let _ = std::fs::remove_file(format!("{}.gkdl", out1.display()));
+    let _ = std::fs::remove_file(format!("{}.gkdl", out2.display()));
+
+    let (base, mgr, _shutdown, _rx) = start_server("").await;
+    let v = call(
+        &base,
+        "aria2.changeGlobalOption",
+        serde_json::json!([{ "max-concurrent-downloads": "1" }]),
+    )
+    .await;
+    assert_eq!(v["result"], "OK");
+
+    // 任务1 慢下载占住唯一槽位
+    let gid1 = add_uri_with_opts(
+        &base,
+        &server.url(),
+        &out1,
+        serde_json::json!({ "max-download-limit": "131072" }),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        mgr.get(&gid1).unwrap().status(),
+        gkdl::task_manager::TaskStatus::Active
+    );
+
+    // 任务2 进入 waiting 队列，然后暂停（排队中暂停）
+    let gid2 = add_uri_with_opts(&base, &server.url(), &out2, serde_json::json!({})).await;
+    assert_eq!(
+        mgr.get(&gid2).unwrap().status(),
+        gkdl::task_manager::TaskStatus::Waiting
+    );
+    let task2 = mgr.get(&gid2).unwrap();
+    let v = call(&base, "aria2.forcePause", serde_json::json!([gid2])).await;
+    assert_eq!(v["result"], "OK");
+    assert_eq!(
+        mgr.get(&gid2).unwrap().status(),
+        gkdl::task_manager::TaskStatus::Paused,
+        "任务2 应为排队中暂停"
+    );
+
+    // 任务1 完成 → 槽位释放 → 任务2 driver 抢到槽位后因已暂停，阻塞在 resume_notify
+    mgr.wait_finished(&gid1).await.expect("任务1失败");
+    // 稍等，让任务2 的 driver 进入 resume_notify 等待
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        mgr.get(&gid2).unwrap().status(),
+        gkdl::task_manager::TaskStatus::Paused,
+        "任务2 应仍处于暂停（等 unpause）"
+    );
+
+    // 删除暂停的排队任务
+    let v = call(&base, "aria2.forceRemove", serde_json::json!([gid2])).await;
+    assert_eq!(v["result"], "OK");
+    assert!(mgr.get(&gid2).is_none(), "任务2 应从任务表移除");
+
+    // 关键断言：driver JoinHandle 必须退出。若 remove() 未唤醒 resume_notify，
+    // driver 永久卡在 notified().await，is_finished() 永远为 false（此处超时即失败）。
+    let driver = task2.driver.lock().unwrap().take().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !driver.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "删除暂停的排队任务后 driver 未退出（resume_notify 未被唤醒）"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    drop(driver);
+
+    let _ = std::fs::remove_file(&out1);
+    let _ = std::fs::remove_file(&out2);
+    let _ = std::fs::remove_file(format!("{}.gkdl", out1.display()));
+    let _ = std::fs::remove_file(format!("{}.gkdl", out2.display()));
+}
+
 #[tokio::test]
 async fn add_uri_sets_custom_user_agent() {
     let data: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
