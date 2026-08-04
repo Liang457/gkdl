@@ -1,0 +1,68 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: 检查与测试
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: 缓存 Cargo 依赖
+        uses: Swatinem/rust-cache@v2
+
+      - name: 格式检查
+        run: cargo fmt --check
+
+      - name: Clippy 静态检查
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: 运行测试
+        run: cargo test --locked
+
+  build:
+    name: 编译 Release 二进制
+    needs: ci
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Cargo 依赖
+        uses: Swatinem/rust-cache@v2
+
+      - name: 编译 Release
+        run: cargo build --release --locked
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: gkdl-windows-x86_64
+          path: target/release/gkdl.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 打 tag 时发布 GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/gkdl.exe
+          generate_release_notes: true
