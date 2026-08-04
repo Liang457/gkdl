@@ -26,6 +26,8 @@ cargo build --release
 # 产物: target\release\gkdl.exe
 ```
 
+> 依赖说明：HTTP 传输基于 **libcurl**（`curl` crate 静态链接，内置 curl 8.21.0 源码，Windows 自动启用 **Schannel** 系统证书，国内环境友好）。构建需要 PATH 上有 C 编译器（curl 源码 + libnghttp2 纯 cc 编译），**无需 cmake / OpenSSL**。中文域名（IDN）由内置 `idna` 转码支持。
+
 ## 用法
 
 ### 直连下载

@@ -273,17 +273,26 @@ async fn list_tasks_status(tasks: impl Iterator<Item = Arc<Task>>) -> Value {
 /// aria2.getVersion 对外声明的启用特性（统一开关）。
 ///
 /// 已实现并声明：
-/// - `Async DNS`：tokio 异步 DNS
-/// - `GZip`：reqwest 已启用 gzip 解压（见 Cargo.toml 中 reqwest 的 `gzip` feature）
-/// - `HTTPS`：rustls
+/// - `Threaded DNS`：curl 线程化异步 DNS
+/// - `HTTPS`：libcurl (Schannel TLS)
+/// - `HTTP/2`：libnghttp2
 /// - `Message Digest`：SHA-256 校验（src/app/hash.rs）
 /// - `XML-RPC`：JSON-RPC over HTTP/WebSocket
+///
+/// 说明：分段下载强制 `Accept-Encoding: identity`（要原始字节），不启用 GZip 解压；
+/// HTTP/3（h3）libcurl 静态版未集成（此前实现亦不支持），无回归。
 ///
 /// 尚未实现、故不声明（若日后实现，把对应字符串加进此数组即可对外启用）：
 /// - `BitTorrent`（含 magnet、tracker、DHT 等）
 /// - `Metalink`
 /// - `Firefox3 Cookie`
-pub const ENABLED_FEATURES: &[&str] = &["Async DNS", "GZip", "HTTPS", "Message Digest", "XML-RPC"];
+pub const ENABLED_FEATURES: &[&str] = &[
+    "Threaded DNS",
+    "HTTPS",
+    "HTTP/2",
+    "Message Digest",
+    "XML-RPC",
+];
 
 async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> RpcResult {
     match method {

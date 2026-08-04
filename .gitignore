@@ -9,6 +9,5 @@ file.bin
 # 日志目录
 logs/
 
-# Qoder
 .qoder/
 .other/

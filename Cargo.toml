@@ -1,12 +1,15 @@
 [package]
 name = "gkdl"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "query", "gzip"] }
+# libcurl 静态链接（内置 curl 8.21.0 源码，Windows 自动启用 Schannel TLS）
+curl = { version = "0.4.50", features = ["static-curl", "http2"] }
+# URL 同款 IDN 实现，用于中文域名转 punycode（curl 线程化 resolver 无 IDN）
+idna = "1"
 axum = { version = "0.8", features = ["ws", "json"] }
 tower-http = { version = "0.7", features = ["cors", "trace"] }
 clap = { version = "4", features = ["derive"] }

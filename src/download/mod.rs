@@ -1,4 +1,5 @@
 pub mod config;
+pub mod curl;
 pub mod detector;
 pub mod engine;
 pub mod mmap_writer;

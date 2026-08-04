@@ -100,30 +100,7 @@ async fn rpc_client_call(
     method: &str,
     params: Vec<serde_json::Value>,
 ) -> anyhow::Result<serde_json::Value> {
-    let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{port}/jsonrpc");
-    let mut body_params = params;
-    if let Some(sec) = secret {
-        if !sec.is_empty() {
-            body_params.insert(0, serde_json::json!(format!("token:{sec}")));
-        }
-    }
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": "cli",
-        "method": method,
-        "params": body_params,
-    });
-    let resp = client
-        .post(&url)
-        .header("Content-Type", "application/json-rpc")
-        .body(body.to_string())
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("连接 daemon 失败: {e}"))?;
-    let text = resp.text().await?;
-    let v: serde_json::Value = serde_json::from_str(&text)?;
-    Ok(v)
+    gkdl::rpc::client::call(port, secret, method, params).await
 }
 
 fn print_rpc(resp: anyhow::Result<serde_json::Value>) -> i32 {

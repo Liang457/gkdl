@@ -1,3 +1,4 @@
+pub mod client;
 pub mod methods;
 pub mod protocol;
 pub mod server;

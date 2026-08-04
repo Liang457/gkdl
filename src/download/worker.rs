@@ -1,11 +1,11 @@
 use crate::download::config::DownloadConfig;
+use crate::download::curl::{curl_error_text, CurlMsg, HttpClient};
 use crate::download::rate_limit::TokenBucket;
 use crate::download::scheduler::WorkStealingScheduler;
 use crate::download::segment::Segment;
-use crate::download::source::SourceManager;
+use crate::download::source::{Source, SourceManager};
 use crate::download::writer::DownloadWriter;
 use anyhow::Result;
-use reqwest::Client;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -17,10 +17,20 @@ enum SegOutcome {
     Paused,
 }
 
+/// 单个数据块的处理结果。
+enum ChunkAction {
+    /// 继续读下一块
+    Continue,
+    /// 停止读流，走收尾（段被截短写满或空块）
+    Stop,
+    /// 直接返回该结果
+    Outcome(SegOutcome),
+}
+
 /// 单个 worker 协程：拉段 → 下载 → 写盘 → 完成/归还。
 pub struct DownloadWorker {
     worker_id: usize,
-    client: Arc<Client>,
+    client: Arc<HttpClient>,
     source_mgr: Arc<SourceManager>,
     scheduler: Arc<WorkStealingScheduler>,
     writer: Arc<dyn DownloadWriter>,
@@ -78,7 +88,7 @@ impl DownloadWorker {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         worker_id: usize,
-        client: Arc<Client>,
+        client: Arc<HttpClient>,
         source_mgr: Arc<SourceManager>,
         scheduler: Arc<WorkStealingScheduler>,
         writer: Arc<dyn DownloadWriter>,
@@ -162,126 +172,228 @@ impl DownloadWorker {
 
         let start = seg.position_to_write();
         let end = seg.end; // exclusive
-        let mut req = self.client.get(&source.url);
-        if self.supports_range {
-            let last = end.saturating_sub(1);
-            req = req.header(reqwest::header::RANGE, format!("bytes={start}-{last}"));
-        }
-        req = req.header(reqwest::header::ACCEPT_ENCODING, "identity");
-
-        // 响应头阶段设超时（客户端本身只有 read_timeout，不覆盖头部等待）
-        let send = tokio::time::timeout(
-            std::time::Duration::from_secs(self.config.timeout.max(5)),
-            req.send(),
-        );
-        let resp = match send.await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                if self.cancel_token.is_cancelled() {
-                    return SegOutcome::Cancelled;
-                }
-                tracing::debug!("worker {} 请求失败: {}", self.worker_id, e);
-                self.source_mgr.report_failure(&source);
-                return SegOutcome::Failed;
-            }
-            Err(_) => {
-                tracing::debug!("worker {} 请求超时", self.worker_id);
+        let range = if self.supports_range {
+            Some((start, end.saturating_sub(1)))
+        } else {
+            None
+        };
+        let (mut rx, _handle) = match self.client.stream_segment(&source.url, range) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("worker {} 创建下载流失败: {}", self.worker_id, e);
                 self.source_mgr.report_failure(&source);
                 return SegOutcome::Failed;
             }
         };
 
-        let status = resp.status();
-        if !(status == reqwest::StatusCode::OK || status == reqwest::StatusCode::PARTIAL_CONTENT) {
+        // 读超时语义：两次 chunk 间隔超时（每次读后重置），更贴合低网速
+        let timeout = std::time::Duration::from_secs(self.config.timeout.max(5));
+        let mut status = 0u32;
+        let mut first_chunk: Option<Vec<u8>> = None;
+
+        // 等待首个数据块；期间更新状态码（重定向会收到多个响应头块）
+        let mut early_end = false;
+        loop {
+            let msg = match tokio::time::timeout(timeout, rx.recv()).await {
+                Ok(v) => v,
+                Err(_) => {
+                    tracing::debug!("worker {} 请求超时", self.worker_id);
+                    self.source_mgr.report_failure(&source);
+                    return SegOutcome::Failed;
+                }
+            };
+            match msg {
+                Some(CurlMsg::Headers { status: s }) => status = s,
+                Some(CurlMsg::Data(c)) => {
+                    first_chunk = Some(c);
+                    break;
+                }
+                Some(CurlMsg::End(Err(e))) => {
+                    if self.cancel_token.is_cancelled() {
+                        return SegOutcome::Cancelled;
+                    }
+                    tracing::debug!(
+                        "worker {} 请求失败: {}",
+                        self.worker_id,
+                        curl_error_text(&e)
+                    );
+                    self.source_mgr.report_failure(&source);
+                    return SegOutcome::Failed;
+                }
+                Some(CurlMsg::End(Ok(()))) => {
+                    early_end = true;
+                    break;
+                }
+                None => {
+                    self.source_mgr.report_failure(&source);
+                    return SegOutcome::Failed;
+                }
+            }
+        }
+
+        if !(status == 200 || status == 206) {
             self.source_mgr.report_failure(&source);
             return SegOutcome::Failed;
         }
 
         // 服务器对 Range 请求返回 200 整文件：字节位置错位，视为失败（引擎会降级处理）
-        if self.supports_range && status == reqwest::StatusCode::OK && start > 0 {
+        if self.supports_range && status == 200 && start > 0 {
             self.source_mgr.report_failure(&source);
             return SegOutcome::Failed;
         }
 
-        let mut stream = resp.bytes_stream();
+        // 未收到任何数据即干净结束（0 字节响应）：走正常完成判定而非读流 None 误报失败
+        if early_end && first_chunk.is_none() {
+            return self.finish_segment(seg, &mut buf, &source, false).await;
+        }
+
         let mut last_tick = Instant::now();
         let mut killed = false;
 
-        while let Some(chunk) = stream.next().await {
-            if self.cancel_token.is_cancelled() {
-                return SegOutcome::Cancelled;
-            }
-            // 暂停检测：刷盘后归还段，等待恢复
-            if self.scheduler.is_paused() {
-                if let Err(e) = buf.flush() {
-                    tracing::warn!("worker {} 暂停刷盘失败: {}", self.worker_id, e);
-                    self.source_mgr.report_failure(&source);
-                    return SegOutcome::Failed;
+        if let Some(chunk) = first_chunk {
+            match self
+                .handle_chunk(seg, &mut buf, &source, chunk, &mut last_tick, &mut killed)
+                .await
+            {
+                ChunkAction::Continue => {}
+                ChunkAction::Stop => {
+                    return self.finish_segment(seg, &mut buf, &source, killed).await
                 }
-                self.scheduler
-                    .update_progress(seg.seg_id, seg.written)
-                    .await;
-                return SegOutcome::Paused;
+                ChunkAction::Outcome(o) => return o,
             }
-            let chunk = match chunk {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::debug!("worker {} 读流错误: {}", self.worker_id, e);
+        }
+
+        loop {
+            let msg = match tokio::time::timeout(timeout, rx.recv()).await {
+                Ok(v) => v,
+                Err(_) => {
+                    tracing::debug!("worker {} 读流超时", self.worker_id);
                     self.source_mgr.report_failure(&source);
                     return SegOutcome::Failed;
                 }
             };
-            if chunk.is_empty() {
-                break;
-            }
-
-            // 限速
-            self.limiter.consume(chunk.len(), &self.cancel_token).await;
-
-            let offset = seg.position_to_write();
-            if let Err(e) = buf.write(offset, &chunk) {
-                tracing::warn!("worker {} 写盘失败: {}", self.worker_id, e);
-                self.source_mgr.report_failure(&source);
-                return SegOutcome::Failed;
-            }
-            seg.written += chunk.len() as u64;
-            seg.tick_bytes += chunk.len() as u64;
-
-            // 速度采样 + 慢线程检测
-            let now = Instant::now();
-            let dt = now.duration_since(last_tick).as_secs_f64();
-            if dt >= self.config.sample_interval {
-                let speed = seg.tick_bytes as f64 / dt;
-                seg.record_speed(speed);
-                seg.tick_bytes = 0;
-                last_tick = now;
-
-                // 同步进度到调度器，并获取被工作窃取截短后的段尾
-                if let Some(cur_end) = self
-                    .scheduler
-                    .update_progress(seg.seg_id, seg.written)
-                    .await
-                {
-                    if cur_end < seg.end {
-                        seg.end = cur_end;
+            let chunk = match msg {
+                Some(CurlMsg::Data(c)) => c,
+                Some(CurlMsg::Headers { .. }) => continue,
+                Some(CurlMsg::End(Ok(()))) => break,
+                Some(CurlMsg::End(Err(e))) => {
+                    if self.cancel_token.is_cancelled() {
+                        return SegOutcome::Cancelled;
                     }
-                    if seg.position_to_write() >= seg.end {
-                        // 段已被截短且本地已写满，剩余部分由窃取者负责
-                        break;
-                    }
+                    tracing::debug!(
+                        "worker {} 读流错误: {}",
+                        self.worker_id,
+                        curl_error_text(&e)
+                    );
+                    self.source_mgr.report_failure(&source);
+                    return SegOutcome::Failed;
                 }
-
-                if self.scheduler.check_slow(self.worker_id, seg).await {
-                    tracing::warn!("worker {} 被判定为慢线程，杀停归还段", self.worker_id);
-                    killed = true;
-                    break;
+                None => {
+                    self.source_mgr.report_failure(&source);
+                    return SegOutcome::Failed;
                 }
+            };
+            match self
+                .handle_chunk(seg, &mut buf, &source, chunk, &mut last_tick, &mut killed)
+                .await
+            {
+                ChunkAction::Continue => {}
+                ChunkAction::Stop => {
+                    return self.finish_segment(seg, &mut buf, &source, killed).await
+                }
+                ChunkAction::Outcome(o) => return o,
             }
         }
 
+        self.finish_segment(seg, &mut buf, &source, killed).await
+    }
+
+    /// 处理单个数据块（保留原 chunk 内全部逻辑）。
+    async fn handle_chunk(
+        &self,
+        seg: &mut Segment,
+        buf: &mut WriteBuffer,
+        source: &Source,
+        chunk: Vec<u8>,
+        last_tick: &mut Instant,
+        killed: &mut bool,
+    ) -> ChunkAction {
+        if self.cancel_token.is_cancelled() {
+            return ChunkAction::Outcome(SegOutcome::Cancelled);
+        }
+        // 暂停检测：刷盘后归还段，等待恢复
+        if self.scheduler.is_paused() {
+            if let Err(e) = buf.flush() {
+                tracing::warn!("worker {} 暂停刷盘失败: {}", self.worker_id, e);
+                self.source_mgr.report_failure(source);
+                return ChunkAction::Outcome(SegOutcome::Failed);
+            }
+            self.scheduler
+                .update_progress(seg.seg_id, seg.written)
+                .await;
+            return ChunkAction::Outcome(SegOutcome::Paused);
+        }
+        if chunk.is_empty() {
+            return ChunkAction::Stop;
+        }
+
+        // 限速
+        self.limiter.consume(chunk.len(), &self.cancel_token).await;
+
+        let offset = seg.position_to_write();
+        if let Err(e) = buf.write(offset, &chunk) {
+            tracing::warn!("worker {} 写盘失败: {}", self.worker_id, e);
+            self.source_mgr.report_failure(source);
+            return ChunkAction::Outcome(SegOutcome::Failed);
+        }
+        seg.written += chunk.len() as u64;
+        seg.tick_bytes += chunk.len() as u64;
+
+        // 速度采样 + 慢线程检测
+        let now = Instant::now();
+        let dt = now.duration_since(*last_tick).as_secs_f64();
+        if dt >= self.config.sample_interval {
+            let speed = seg.tick_bytes as f64 / dt;
+            seg.record_speed(speed);
+            seg.tick_bytes = 0;
+            *last_tick = now;
+
+            // 同步进度到调度器，并获取被工作窃取截短后的段尾
+            if let Some(cur_end) = self
+                .scheduler
+                .update_progress(seg.seg_id, seg.written)
+                .await
+            {
+                if cur_end < seg.end {
+                    seg.end = cur_end;
+                }
+                if seg.position_to_write() >= seg.end {
+                    // 段已被截短且本地已写满，剩余部分由窃取者负责
+                    return ChunkAction::Stop;
+                }
+            }
+
+            if self.scheduler.check_slow(self.worker_id, seg).await {
+                tracing::warn!("worker {} 被判定为慢线程，杀停归还段", self.worker_id);
+                *killed = true;
+                // 走 finish_segment：先刷盘（written 已含缓冲字节）再归还段，避免数据洞
+                return ChunkAction::Stop;
+            }
+        }
+        ChunkAction::Continue
+    }
+
+    /// 段收尾：刷盘 + 慢线程清理 + 判定 Complete/Failed。
+    async fn finish_segment(
+        &self,
+        seg: &mut Segment,
+        buf: &mut WriteBuffer,
+        source: &Source,
+        killed: bool,
+    ) -> SegOutcome {
         if let Err(e) = buf.flush() {
             tracing::warn!("worker {} 刷盘失败: {}", self.worker_id, e);
-            self.source_mgr.report_failure(&source);
+            self.source_mgr.report_failure(source);
             return SegOutcome::Failed;
         }
 
@@ -291,7 +403,7 @@ impl DownloadWorker {
             return SegOutcome::Killed;
         }
 
-        self.source_mgr.report_success(&source);
+        self.source_mgr.report_success(source);
 
         if seg.is_complete() {
             SegOutcome::Complete
@@ -303,7 +415,6 @@ impl DownloadWorker {
 }
 
 use crate::download::scheduler::FailureAction;
-use futures_util::StreamExt;
 
 #[cfg(test)]
 mod tests {

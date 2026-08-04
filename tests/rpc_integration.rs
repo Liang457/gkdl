@@ -117,17 +117,83 @@ async fn start_server_with_db(
     (format!("http://{addr}"), mgr, db, shutdown, rx)
 }
 
-async fn call_raw(base: &str, body: &str) -> (reqwest::StatusCode, serde_json::Value) {
-    let resp = reqwest::Client::new()
-        .post(format!("{base}/jsonrpc"))
-        .header("Content-Type", "application/json")
-        .body(body.to_string())
-        .send()
-        .await
-        .unwrap();
-    let status = resp.status();
-    let json = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+/// libcurl POST 原始 JSON 请求，返回 (状态码, JSON)。
+async fn call_raw(base: &str, body: &str) -> (u32, serde_json::Value) {
+    let url = format!("{base}/jsonrpc");
+    let body_str = body.to_string();
+    let (status, text) = tokio::task::spawn_blocking(move || {
+        let mut easy = curl::easy::Easy::new();
+        easy.url(&url).unwrap();
+        easy.post(true).unwrap();
+        easy.post_fields_copy(body_str.as_bytes()).unwrap();
+        let mut list = curl::easy::List::new();
+        list.append("Content-Type: application/json").unwrap();
+        easy.http_headers(list).unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut transfer = easy.transfer();
+            transfer
+                .write_function(|d| {
+                    buf.extend_from_slice(d);
+                    Ok(d.len())
+                })
+                .unwrap();
+            let _ = transfer.perform();
+        }
+        let status = easy.response_code().unwrap_or(0);
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        (status, text)
+    })
+    .await
+    .unwrap();
+    let json = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
     (status, json)
+}
+
+/// libcurl GET 请求 `/jsonrpc`（值会做 URL 编码），返回 (状态码, JSON)。
+async fn call_get(base: &str, query: &[(&str, &str)]) -> (u32, serde_json::Value) {
+    let mut url = format!("{base}/jsonrpc");
+    for (i, (k, v)) in query.iter().enumerate() {
+        url.push(if i == 0 { '?' } else { '&' });
+        url.push_str(k);
+        url.push('=');
+        url.push_str(&urlencode(v));
+    }
+    let (status, text) = tokio::task::spawn_blocking(move || {
+        let mut easy = curl::easy::Easy::new();
+        easy.url(&url).unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut transfer = easy.transfer();
+            transfer
+                .write_function(|d| {
+                    buf.extend_from_slice(d);
+                    Ok(d.len())
+                })
+                .unwrap();
+            let _ = transfer.perform();
+        }
+        let status = easy.response_code().unwrap_or(0);
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        (status, text)
+    })
+    .await
+    .unwrap();
+    let json = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 async fn call(base: &str, method: &str, params: serde_json::Value) -> serde_json::Value {
@@ -288,13 +354,8 @@ async fn rpc_server_serves_aria2_methods() {
     // 鉴权失败：错误 token → 400 且延迟
     let t0 = std::time::Instant::now();
     let body = serde_json::json!({"jsonrpc":"2.0","id":"a","method":"aria2.tellActive","params":["token:wrong"]});
-    let resp = reqwest::Client::new()
-        .post(format!("{base}/jsonrpc"))
-        .body(body.to_string())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 400);
+    let (status, _) = call_raw(&base, &body.to_string()).await;
+    assert_eq!(status, 400);
     assert!(t0.elapsed() >= std::time::Duration::from_millis(900));
 
     // addUri + tellStatus
@@ -1084,14 +1145,12 @@ async fn get_jsonp_base64_params_are_recognized() {
     ]);
     let b64 = base64_encode(json.to_string().as_bytes());
     let id = "《蔚蓝档案》3rd PV.mp4";
-    let resp = reqwest::Client::new()
-        .get(format!("{base}/jsonrpc"))
-        .query(&[("method", "aria2.addUri"), ("id", id), ("params", &b64)])
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let v: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    let (status, v) = call_get(
+        &base,
+        &[("method", "aria2.addUri"), ("id", id), ("params", &b64)],
+    )
+    .await;
+    assert_eq!(status, 200);
     let gid = v["result"].as_str().expect("GET addUri 应返回 gid");
     assert_eq!(v["id"].as_str(), Some(id), "id 应原样回显");
 

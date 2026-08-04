@@ -1,5 +1,6 @@
 use crate::app::db::{DownloadRecord, SegmentRecord, StateDb};
 use crate::download::config::DownloadConfig;
+use crate::download::curl::{HttpClient, ProbeInfo};
 use crate::download::mmap_writer::MmapWriter;
 use crate::download::rate_limit::TokenBucket;
 use crate::download::scheduler::WorkStealingScheduler;
@@ -8,8 +9,6 @@ use crate::download::source::SourceManager;
 use crate::download::worker::DownloadWorker;
 use crate::download::writer::{DownloadWriter, MemoryWriter};
 use anyhow::{anyhow, bail, Context, Result};
-use reqwest::header::{ACCEPT_ENCODING, CONTENT_LENGTH, RANGE};
-use reqwest::{Client, StatusCode};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -28,11 +27,6 @@ pub struct DownloadReport {
     pub path: PathBuf,
     pub total: u64,
     pub elapsed: Duration,
-}
-
-struct ProbeInfo {
-    total: u64,
-    supports_range: bool,
 }
 
 /// 后台下载句柄：pause/resume/cancel/join。
@@ -114,75 +108,14 @@ impl DownloadHandle {
 }
 
 async fn probe(
-    client: &Client,
+    client: &HttpClient,
     url: &str,
     cancel: &CancellationToken,
     timeout: u64,
 ) -> Result<ProbeInfo> {
     // 用 GET Range: bytes=0-0 权威探测总长与 Range 支持
     // （有些服务器 HEAD 谎报 Accept-Ranges，必须实测）
-    let req = client
-        .get(url)
-        .header(RANGE, "bytes=0-0")
-        .header(ACCEPT_ENCODING, "identity")
-        // 探测只读响应头，可以设总超时（下载阶段不用总超时，见 build_client）
-        .timeout(Duration::from_secs(timeout.max(5)));
-    let resp = tokio::select! {
-        r = req.send() => r.context("探测请求失败")?,
-        _ = cancel.cancelled() => bail!("下载已取消"),
-    };
-
-    if resp.status() == StatusCode::PARTIAL_CONTENT {
-        let content_range = resp
-            .headers()
-            .get("content-range")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| anyhow!("206 响应缺少 Content-Range"))?;
-        // bytes 0-0/12345
-        let total = content_range
-            .split('/')
-            .nth(1)
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .ok_or_else(|| anyhow!("Content-Range 解析失败: {content_range}"))?;
-        if total == 0 {
-            bail!("文件大小为 0");
-        }
-        Ok(ProbeInfo {
-            total,
-            supports_range: true,
-        })
-    } else if resp.status() == StatusCode::OK {
-        // HEAD 作为总长兜底
-        let head_len = client
-            .head(url)
-            .timeout(Duration::from_secs(timeout.max(5)))
-            .send()
-            .await
-            .ok()
-            .and_then(|r| {
-                r.headers()
-                    .get(CONTENT_LENGTH)
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string())
-            })
-            .and_then(|s| s.parse::<u64>().ok());
-        let total = resp
-            .headers()
-            .get(CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .or(head_len)
-            .ok_or_else(|| anyhow!("无法获取文件大小"))?;
-        if total == 0 {
-            bail!("文件大小为 0");
-        }
-        Ok(ProbeInfo {
-            total,
-            supports_range: false,
-        })
-    } else {
-        bail!("探测失败: HTTP {}", resp.status())
-    }
+    client.probe(url, cancel, timeout).await
 }
 
 /// 从 URL 提取文件名（百分号解码）。
@@ -227,46 +160,8 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-fn build_client(config: &DownloadConfig) -> Result<Client> {
-    let ua = if config.user_agent.trim().is_empty() {
-        crate::download::config::default_user_agent()
-    } else {
-        config.user_agent.clone()
-    };
-    let mut builder = Client::builder().user_agent(ua);
-    if !config.referer.trim().is_empty() || !config.header.is_empty() {
-        let mut headers = reqwest::header::HeaderMap::new();
-        if !config.referer.trim().is_empty() {
-            if let Ok(v) = reqwest::header::HeaderValue::from_str(config.referer.trim()) {
-                headers.insert(reqwest::header::REFERER, v);
-            }
-        }
-        for h in &config.header {
-            let Some((name, value)) = h.split_once(':') else {
-                tracing::warn!("忽略无效的请求头（缺少冒号）: {h}");
-                continue;
-            };
-            let name = name.trim();
-            let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
-                tracing::warn!("忽略无效的请求头名称: {h}");
-                continue;
-            };
-            if let Ok(v) = reqwest::header::HeaderValue::from_str(value.trim()) {
-                headers.append(name, v);
-            } else {
-                tracing::warn!("忽略无效的请求头值: {h}");
-            }
-        }
-        builder = builder.default_headers(headers);
-    }
-    builder
-        // 不能用总超时（timeout）：那会在 30s 掐断所有耗时更长的下载。
-        // 改用 read_timeout（每次成功读后重置），只检测停滞的连接。
-        .read_timeout(Duration::from_secs(config.timeout.max(5)))
-        .connect_timeout(Duration::from_secs(config.timeout.max(5)))
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .context("HTTP 客户端构建失败")
+fn build_client(config: &DownloadConfig) -> Result<HttpClient> {
+    HttpClient::new(config)
 }
 
 /// 构造持久化任务记录（写入状态库）。
