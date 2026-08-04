@@ -1,3 +1,4 @@
+use crate::download::writer::DownloadWriter;
 use anyhow::{bail, Context, Result};
 use memmap2::MmapRaw;
 use std::fs::{File, OpenOptions};
@@ -115,6 +116,29 @@ impl MmapWriter {
 }
 
 use memmap2::MmapOptions;
+
+impl DownloadWriter for MmapWriter {
+    fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
+        MmapWriter::write_at(self, offset, data)
+    }
+
+    fn flush_range(&self, offset: u64, len: u64) {
+        MmapWriter::flush_range(self, offset, len);
+    }
+
+    fn flush_all(&self) -> Result<()> {
+        MmapWriter::flush_all(self)
+    }
+
+    fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// 磁盘模式：文件已随下载预分配并落盘，无需额外收尾。
+    fn finalize(&self, _out_path: &Path) -> Result<()> {
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {

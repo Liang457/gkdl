@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+/// 内存模式阈值上界：超过该值强制磁盘，防误配导致内存暴涨。
+pub const MEMORY_THRESHOLD_CAP: u64 = 64 * 1024 * 1024;
+
 /// 下载参数（对应《多线程下载算法设计》§4 参数表）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadConfig {
@@ -9,6 +12,10 @@ pub struct DownloadConfig {
     /// 最小碎片字节数
     #[serde(default = "default_min_split_size")]
     pub min_split_size: u64,
+    /// 内存模式阈值（字节）：文件小于等于该值则不下临时文件、直接在内存累积。
+    /// `<= 0` 表示禁用该功能（全部走磁盘）。上限受 `MEMORY_THRESHOLD_CAP` 钳制。
+    #[serde(default = "default_memory_threshold")]
+    pub memory_threshold: u64,
     /// 写盘缓冲
     #[serde(default = "default_write_buffer_size")]
     pub write_buffer_size: usize,
@@ -68,6 +75,9 @@ fn default_split() -> usize {
 fn default_min_split_size() -> u64 {
     256 * 1024
 }
+fn default_memory_threshold() -> u64 {
+    8 * 1024 * 1024
+}
 fn default_write_buffer_size() -> usize {
     64 * 1024
 }
@@ -112,6 +122,7 @@ impl Default for DownloadConfig {
         Self {
             split: default_split(),
             min_split_size: default_min_split_size(),
+            memory_threshold: default_memory_threshold(),
             write_buffer_size: default_write_buffer_size(),
             sample_interval: default_sample_interval(),
             speed_window: default_speed_window(),

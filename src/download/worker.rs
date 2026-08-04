@@ -1,9 +1,9 @@
 use crate::download::config::DownloadConfig;
-use crate::download::mmap_writer::MmapWriter;
 use crate::download::rate_limit::TokenBucket;
 use crate::download::scheduler::WorkStealingScheduler;
 use crate::download::segment::Segment;
 use crate::download::source::SourceManager;
+use crate::download::writer::DownloadWriter;
 use anyhow::Result;
 use reqwest::Client;
 use std::sync::Arc;
@@ -23,7 +23,7 @@ pub struct DownloadWorker {
     client: Arc<Client>,
     source_mgr: Arc<SourceManager>,
     scheduler: Arc<WorkStealingScheduler>,
-    writer: Arc<MmapWriter>,
+    writer: Arc<dyn DownloadWriter>,
     limiter: TokenBucket,
     config: DownloadConfig,
     supports_range: bool,
@@ -34,12 +34,12 @@ pub struct DownloadWorker {
 struct WriteBuffer {
     buf: Vec<u8>,
     offset: u64,
-    writer: Arc<MmapWriter>,
+    writer: Arc<dyn DownloadWriter>,
     max: usize,
 }
 
 impl WriteBuffer {
-    fn new(writer: Arc<MmapWriter>, max: usize) -> Self {
+    fn new(writer: Arc<dyn DownloadWriter>, max: usize) -> Self {
         Self {
             buf: Vec::with_capacity(max),
             offset: 0,
@@ -81,7 +81,7 @@ impl DownloadWorker {
         client: Arc<Client>,
         source_mgr: Arc<SourceManager>,
         scheduler: Arc<WorkStealingScheduler>,
-        writer: Arc<MmapWriter>,
+        writer: Arc<dyn DownloadWriter>,
         limiter: TokenBucket,
         config: DownloadConfig,
         supports_range: bool,
@@ -308,11 +308,12 @@ use futures_util::StreamExt;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::download::mmap_writer::MmapWriter;
 
     #[test]
     fn write_buffer_flushes_contiguously() {
         let p = std::env::temp_dir().join("gkdl_wbuf.tmp");
-        let writer = Arc::new(MmapWriter::new(&p, 1024).unwrap());
+        let writer: Arc<dyn DownloadWriter> = Arc::new(MmapWriter::new(&p, 1024).unwrap());
         let mut buf = WriteBuffer::new(Arc::clone(&writer), 64);
         buf.write(0, &[1u8; 40]).unwrap();
         assert_eq!(buf.buf.len(), 40);

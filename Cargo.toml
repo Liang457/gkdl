@@ -23,6 +23,7 @@ futures-util = "0.3"
 sha2 = "0.11"
 hex = "0.4"
 yaml_serde = "0.10"
+rusqlite = { version = "0.31", features = ["bundled"] }
 tar = "0.4"
 flate2 = "1"
 xz2 = "0.1"

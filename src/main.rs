@@ -3,6 +3,7 @@
 use clap::Parser;
 use gkdl::app::cli::{Cli, Command, DaemonArgs};
 use gkdl::app::config::{self, ConfigStore, LogConfig};
+use gkdl::app::db::StateDb;
 use gkdl::app::hooks::HookConfig;
 use gkdl::app::logging;
 use gkdl::app::task_manager::{self, TaskManager};
@@ -159,6 +160,12 @@ async fn run_download(args: gkdl::app::cli::DownloadArgs) -> i32 {
     if let Some(v) = args.min_split_size {
         config.min_split_size = v;
     }
+    if let Some(v) = args.memory_threshold {
+        config.memory_threshold = v;
+    }
+    if args.no_memory {
+        config.memory_threshold = 0;
+    }
     if let Some(v) = args.retries {
         config.max_retries = v;
     }
@@ -170,7 +177,18 @@ async fn run_download(args: gkdl::app::cli::DownloadArgs) -> i32 {
         script: args.post_script.clone(),
         ..Default::default()
     };
-    let mgr = TaskManager::new(hook, config.clone());
+    // CLI 直连模式同样走状态库（无 .gkdl 控制文件），可跨次续传；打不开则降级为无持久化
+    let state_db = config::default_config_path()
+        .parent()
+        .map(|p| p.join("state.db"))
+        .and_then(|p| match StateDb::open(&p) {
+            Ok(db) => Some(std::sync::Arc::new(db)),
+            Err(e) => {
+                eprintln!("警告: 打开状态数据库失败，本次下载将不保留续传信息: {e:#}");
+                None
+            }
+        });
+    let mgr = TaskManager::new(hook, config.clone(), state_db);
 
     let tty = std::io::stdout().is_terminal();
     let gid = match mgr
@@ -254,11 +272,32 @@ async fn run_daemon(args: DaemonArgs) -> i32 {
     // 初始化日志（daemon 模式）
     let _ = logging::init_logging(&config_dir, &file_cfg.log);
 
+    // 打开状态数据库（SQLite，替换下载目录下的 .gkdl 控制文件）
+    let state_db_path = {
+        let p = std::path::PathBuf::from(file_cfg.state.db_path.trim());
+        if p.is_absolute() {
+            p
+        } else {
+            config_dir.join(p)
+        }
+    };
+    let state_db = match StateDb::open(&state_db_path) {
+        Ok(db) => {
+            tracing::info!("状态数据库: {}", db.path.display());
+            db
+        }
+        Err(e) => {
+            eprintln!("打开状态数据库失败: {e:#}");
+            return 1;
+        }
+    };
+
     // 合并下载配置
     let download_cfg = file_cfg.download.clone();
     let global_opts = GlobalOptions {
         split: download_cfg.split,
         min_split_size: download_cfg.min_split_size,
+        memory_threshold: download_cfg.memory_threshold,
         retries: download_cfg.max_retries,
         timeout: download_cfg.timeout,
         piece_length: download_cfg.piece_length,
@@ -301,11 +340,42 @@ async fn run_daemon(args: DaemonArgs) -> i32 {
         }
     };
 
-    let mgr = TaskManager::new(hook, download_cfg);
+    let mgr = TaskManager::new(hook, download_cfg, Some(std::sync::Arc::new(state_db)));
     mgr.set_max_concurrent(global_opts.max_concurrent_downloads);
     mgr.set_global_rate_limit(global_opts.max_overall_download_limit);
     let global = Arc::new(tokio::sync::Mutex::new(global_opts));
     let secret = daemon_cfg.rpc_secret.clone();
+
+    // 恢复上次中断的任务（视为暂停，不自动重启）
+    match mgr.rehydrate_from_db().await {
+        Ok(n) => {
+            if n > 0 {
+                tracing::info!("恢复 {} 个中断任务（暂停状态）", n);
+            }
+        }
+        Err(e) => tracing::warn!("恢复中断任务失败: {e:#}"),
+    }
+
+    // 后台清理：定期删除超过保留期的已结束记录（启动时先清一次，之后每 6 小时）
+    {
+        let retention = file_cfg.state.retention_days;
+        let db_for_cleanup = mgr.db().clone();
+        tokio::spawn(async move {
+            loop {
+                if let Some(db) = &db_for_cleanup {
+                    match db.cleanup_completed(retention) {
+                        Ok(n) => {
+                            if n > 0 {
+                                tracing::info!("清理了 {} 条过期任务记录", n);
+                            }
+                        }
+                        Err(e) => tracing::warn!("清理过期任务记录失败: {e:#}"),
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
+            }
+        });
+    }
 
     // 运行时配置存储：RPC 修改的设置会同步写回 config.yaml
     let store = Arc::new(ConfigStore::new(config_path.clone(), file_cfg.clone()));

@@ -69,6 +69,25 @@ impl Default for HookConfigFile {
     }
 }
 
+/// 状态库配置（SQLite）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StateConfig {
+    /// 状态数据库路径，空或相对路径基于配置目录解析；空则默认 state.db
+    pub db_path: String,
+    /// 已完成/失败记录保留天数（0 = 永久保留）
+    pub retention_days: u32,
+}
+
+impl Default for StateConfig {
+    fn default() -> Self {
+        Self {
+            db_path: "state.db".into(),
+            retention_days: crate::app::db::DEFAULT_RETENTION_DAYS,
+        }
+    }
+}
+
 /// 运行时配置存储：内存中的 Config + 磁盘路径，RPC 修改设置后同步落盘。
 #[derive(Clone)]
 pub struct ConfigStore {
@@ -99,6 +118,7 @@ pub struct Config {
     pub download: DownloadConfig,
     pub log: LogConfig,
     pub hook: HookConfigFile,
+    pub state: StateConfig,
 }
 
 /// 默认配置路径：%APPDATA%\gkdl\config.yaml

@@ -1,8 +1,10 @@
 mod common;
 
 use common::TestServer;
+use gkdl::app::db::StateDb;
 use gkdl::download::config::DownloadConfig;
 use gkdl::download::engine;
+use std::sync::Arc;
 use std::time::Duration;
 
 fn make_data(size: usize) -> Vec<u8> {
@@ -15,22 +17,37 @@ fn out_path(name: &str) -> std::path::PathBuf {
     dir.join(format!("{}_{}.bin", name, std::process::id()))
 }
 
+fn temp_db(name: &str) -> Arc<StateDb> {
+    let p =
+        std::env::temp_dir()
+            .join("gkdl_it")
+            .join(format!("{}_{}.db", name, std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    Arc::new(StateDb::open(&p).unwrap())
+}
+
 #[tokio::test]
 async fn multi_thread_range_download_matches() {
     let data = make_data(1_048_576); // 1 MiB
     let server = TestServer::start(data.clone(), false).await;
     let out = out_path("range");
     let _ = std::fs::remove_file(&out);
-    let _ = std::fs::remove_file(format!("{}.gkdl", out.display()));
 
     let config = DownloadConfig {
         split: 4,
         min_split_size: 64 * 1024,
         ..Default::default()
     };
-    let report = engine::download(vec![server.url()], Some(out.clone()), config, None, |_| {})
-        .await
-        .expect("下载失败");
+    let report = engine::download(
+        vec![server.url()],
+        Some(out.clone()),
+        config,
+        None,
+        None,
+        |_| {},
+    )
+    .await
+    .expect("下载失败");
     assert_eq!(report.total as usize, data.len());
 
     let written = std::fs::read(&out).expect("读输出文件失败");
@@ -44,7 +61,6 @@ async fn multi_source_failover_skips_bad_url() {
     let server = TestServer::start(data.clone(), false).await;
     let out = out_path("failover");
     let _ = std::fs::remove_file(&out);
-    let _ = std::fs::remove_file(format!("{}.gkdl", out.display()));
 
     let config = DownloadConfig {
         split: 4,
@@ -52,7 +68,7 @@ async fn multi_source_failover_skips_bad_url() {
         ..Default::default()
     };
     let urls = vec![server.fail_url(), server.broken_url(), server.url()];
-    let report = engine::download(urls, Some(out.clone()), config, None, |_| {})
+    let report = engine::download(urls, Some(out.clone()), config, None, None, |_| {})
         .await
         .expect("多源下载失败");
     assert_eq!(report.total as usize, data.len());
@@ -68,16 +84,22 @@ async fn server_without_range_falls_back_to_single_stream() {
     let server = TestServer::start(data.clone(), true).await; // ignore_range = true
     let out = out_path("norange");
     let _ = std::fs::remove_file(&out);
-    let _ = std::fs::remove_file(format!("{}.gkdl", out.display()));
 
     let config = DownloadConfig {
         split: 8,
         min_split_size: 32 * 1024,
         ..Default::default()
     };
-    let report = engine::download(vec![server.url()], Some(out.clone()), config, None, |_| {})
-        .await
-        .expect("无 Range 服务器下载失败");
+    let report = engine::download(
+        vec![server.url()],
+        Some(out.clone()),
+        config,
+        None,
+        None,
+        |_| {},
+    )
+    .await
+    .expect("无 Range 服务器下载失败");
     assert_eq!(report.total as usize, data.len());
 
     let written = std::fs::read(&out).unwrap();
@@ -94,7 +116,6 @@ async fn sha256_verification_passes_and_fails() {
     // 正确 hash
     let out1 = out_path("hash_ok");
     let _ = std::fs::remove_file(&out1);
-    let _ = std::fs::remove_file(format!("{}.gkdl", out1.display()));
     let digest = gkdl::app::hash::sha256_file(&{
         std::fs::write(&out1, &data).unwrap();
         out1.clone()
@@ -106,6 +127,7 @@ async fn sha256_verification_passes_and_fails() {
         Some(out1.clone()),
         config.clone(),
         Some(digest),
+        None,
         |_| {},
     )
     .await
@@ -115,13 +137,13 @@ async fn sha256_verification_passes_and_fails() {
     // 错误 hash
     let out2 = out_path("hash_bad");
     let _ = std::fs::remove_file(&out2);
-    let _ = std::fs::remove_file(format!("{}.gkdl", out2.display()));
     let bad = "0".repeat(64);
     let err = engine::download(
         vec![server.url()],
         Some(out2.clone()),
         config,
         Some(bad),
+        None,
         |_| {},
     )
     .await;
@@ -136,7 +158,6 @@ async fn rate_limit_slows_download() {
     let server = TestServer::start(data.clone(), false).await;
     let out = out_path("ratelimit");
     let _ = std::fs::remove_file(&out);
-    let _ = std::fs::remove_file(format!("{}.gkdl", out.display()));
 
     let config = DownloadConfig {
         split: 4,
@@ -144,9 +165,16 @@ async fn rate_limit_slows_download() {
         ..Default::default()
     };
     let t0 = std::time::Instant::now();
-    engine::download(vec![server.url()], Some(out.clone()), config, None, |_| {})
-        .await
-        .expect("限速下载失败");
+    engine::download(
+        vec![server.url()],
+        Some(out.clone()),
+        config,
+        None,
+        None,
+        |_| {},
+    )
+    .await
+    .expect("限速下载失败");
     let elapsed = t0.elapsed();
     assert!(
         elapsed >= Duration::from_millis(1500),
@@ -155,19 +183,21 @@ async fn rate_limit_slows_download() {
     std::fs::remove_file(&out).ok();
 }
 
+/// 磁盘模式（memory_threshold=0）下，中断后可从状态库续传。
 #[tokio::test]
-async fn interrupted_download_resumes_from_control_file() {
+async fn interrupted_download_resumes_from_db() {
     let data = make_data(4 * 1024 * 1024); // 4 MiB
     let server = TestServer::start(data.clone(), false).await;
     let out = out_path("resume_it");
     let _ = std::fs::remove_file(&out);
-    let _ = std::fs::remove_file(format!("{}.gkdl", out.display()));
+    let db = temp_db("resume_it");
 
-    // 第一次：限速慢速下载，约 1 秒后取消
+    // 第一次：限速慢速下载，约 1 秒后取消（内存阈值 0 → 磁盘模式）
     let config = DownloadConfig {
         split: 4,
         rate_limit: 2 * 1024 * 1024,
         min_split_size: 256 * 1024,
+        memory_threshold: 0,
         ..Default::default()
     };
     let handle = engine::start_download(
@@ -177,6 +207,8 @@ async fn interrupted_download_resumes_from_control_file() {
         None,
         None,
         tokio_util::sync::CancellationToken::new(),
+        Some(Arc::clone(&db)),
+        Some("resume_test_gid".into()),
         |_| {},
     )
     .await
@@ -185,24 +217,132 @@ async fn interrupted_download_resumes_from_control_file() {
     handle.cancel();
     let _ = handle.join().await; // 取消后返回 Err，忽略
 
-    let control = format!("{}.gkdl", out.display());
-    assert!(
-        std::path::Path::new(&control).exists(),
-        "取消后应存在控制文件"
-    );
+    // 取消后状态库中应有 paused 记录（段进度保留）
+    let rec = db
+        .load_download("resume_test_gid")
+        .unwrap()
+        .expect("应有记录");
+    assert_eq!(rec.status, "paused", "取消后应为 paused");
+    let written: u64 = rec.segments.iter().map(|s| s.written).sum();
+    assert!(written > 0, "取消后应已下载部分字节");
 
-    // 第二次：重新下载应续传并成功
-    let report = engine::download(vec![server.url()], Some(out.clone()), config, None, |_| {})
-        .await
-        .expect("续传下载失败");
+    // 第二次：重新下载应从记录续传并成功（沿用同一 gid，状态库标记 complete）
+    let handle = engine::start_download(
+        vec![server.url()],
+        Some(out.clone()),
+        config,
+        None,
+        None,
+        tokio_util::sync::CancellationToken::new(),
+        Some(Arc::clone(&db)),
+        Some("resume_test_gid".into()),
+        |_| {},
+    )
+    .await
+    .expect("续传启动失败");
+    let report = handle.join().await.expect("续传下载失败");
     assert_eq!(report.total as usize, data.len());
 
     let written = std::fs::read(&out).unwrap();
     assert_eq!(written, data, "续传内容不一致");
-    assert!(
-        !std::path::Path::new(&control).exists(),
-        "成功后应删除控制文件"
+    // 完成后状态库应标记 complete
+    assert_eq!(
+        db.load_download("resume_test_gid").unwrap().unwrap().status,
+        "complete"
     );
+    std::fs::remove_file(&out).ok();
+}
+
+/// 内存模式：下载期间不产生输出文件，完成后原子落盘。
+#[tokio::test]
+async fn small_file_memory_mode_no_file_until_done() {
+    let data = make_data(256 * 1024); // 256 KiB < 8 MiB 默认阈值
+    let server = TestServer::start(data.clone(), false).await;
+    let out = out_path("memory_it");
+    let _ = std::fs::remove_file(&out);
+    let db = temp_db("memory_it");
+
+    let config = DownloadConfig {
+        split: 4,
+        rate_limit: 256 * 1024, // 256 KB/s → 256 KiB 约 1s，留足观察窗口
+        ..Default::default()
+    };
+    let handle = engine::start_download(
+        vec![server.url()],
+        Some(out.clone()),
+        config,
+        None,
+        None,
+        tokio_util::sync::CancellationToken::new(),
+        Some(Arc::clone(&db)),
+        Some("memory_gid".into()),
+        |_| {},
+    )
+    .await
+    .expect("启动下载失败");
+
+    // 下载进行中：输出文件不应存在（内存模式不预分配）
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !out.exists(),
+        "内存模式下载中不应产生输出文件: {}",
+        out.display()
+    );
+
+    handle.join().await.expect("下载失败");
+    assert!(out.exists(), "下载完成后应写入输出文件");
+    let written = std::fs::read(&out).unwrap();
+    assert_eq!(written, data, "内存模式内容不一致");
+    // 无 .gkdl 控制文件、无临时文件残留
+    assert!(
+        !std::path::Path::new(&format!("{}.gkdl", out.display())).exists(),
+        "不应存在控制文件"
+    );
+    assert!(!out.with_extension("gkdl.tmp").exists(), "不应残留临时文件");
+    // 状态库记录 memory_mode 标记
+    let rec = db.load_download("memory_gid").unwrap().unwrap();
+    assert!(rec.memory_mode, "应为内存模式记录");
+    assert_eq!(rec.status, "complete");
+    std::fs::remove_file(&out).ok();
+}
+
+/// 阈值设 0（禁用内存模式）：小文件也走磁盘（下载中文件即存在）。
+#[tokio::test]
+async fn memory_mode_disabled_uses_disk() {
+    let data = make_data(256 * 1024);
+    let server = TestServer::start(data.clone(), false).await;
+    let out = out_path("nmemory");
+    let _ = std::fs::remove_file(&out);
+
+    let config = DownloadConfig {
+        split: 4,
+        rate_limit: 2 * 1024 * 1024,
+        memory_threshold: 0, // 禁用内存模式
+        ..Default::default()
+    };
+    let handle = engine::start_download(
+        vec![server.url()],
+        Some(out.clone()),
+        config,
+        None,
+        None,
+        tokio_util::sync::CancellationToken::new(),
+        None,
+        None,
+        |_| {},
+    )
+    .await
+    .expect("启动下载失败");
+
+    // 磁盘模式：文件预分配，下载中即存在
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(out.exists(), "磁盘模式下载中应已创建文件");
+    let meta = std::fs::metadata(&out).unwrap();
+    assert_eq!(meta.len(), data.len() as u64, "磁盘模式预分配全尺寸");
+
+    handle.join().await.expect("下载失败");
+    let written = std::fs::read(&out).unwrap();
+    assert_eq!(written, data, "磁盘模式内容不一致");
     std::fs::remove_file(&out).ok();
 }
 
@@ -214,7 +354,6 @@ async fn slow_server_path_download_completes() {
     let server = TestServer::start_slow(data.clone(), false, 200).await;
     let out = out_path("slow_path");
     let _ = std::fs::remove_file(&out);
-    let _ = std::fs::remove_file(format!("{}.gkdl", out.display()));
 
     let config = DownloadConfig {
         split: 4,
@@ -229,6 +368,7 @@ async fn slow_server_path_download_completes() {
         vec![server.url_slow()],
         Some(out.clone()),
         config,
+        None,
         None,
         |_| {},
     )
@@ -248,7 +388,6 @@ async fn slow_server_with_multi_source_failover() {
     let server = TestServer::start_slow(data.clone(), false, 100).await;
     let out = out_path("slow_failover");
     let _ = std::fs::remove_file(&out);
-    let _ = std::fs::remove_file(format!("{}.gkdl", out.display()));
 
     let config = DownloadConfig {
         split: 4,
@@ -258,7 +397,7 @@ async fn slow_server_with_multi_source_failover() {
     };
     // 慢路径作为备选源，失败路径优先
     let urls = vec![server.fail_url(), server.url_slow(), server.url()];
-    let report = engine::download(urls, Some(out.clone()), config, None, |_| {})
+    let report = engine::download(urls, Some(out.clone()), config, None, None, |_| {})
         .await
         .expect("多源慢服务器下载失败");
     assert_eq!(report.total as usize, data.len());

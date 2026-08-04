@@ -10,7 +10,8 @@ Rust 实现的多线程下载器（Windows 可用），带 **aria2/AriaNg 兼容
 
 - **多线程 Range 切片下载**：按 `split` 预切，快线程完成自己的段后自动**工作窃取**最慢段的尾部 40%
 - **慢线程三层检测**：低于中位速度 30% → 连续确认 → P10 尾部确认 → 杀停归还段
-- **断点续传**：`<文件名>.gkdl` 控制文件每秒保存段进度，中断后自动续传
+- **小文件内存模式**：文件 ≤ `memory_threshold`（默认 8MB，可配置，`0` 禁用）时不下临时文件，下载到内存，完成后原子落盘（`.gkdl.tmp` + rename）
+- **断点续传**：段进度统一存入 SQLite 状态库（`%APPDATA%\gkdl\state.db`），中断后自动续传；已完成/失败记录默认保留 7 天自动清理
 - **SHA-256 校验**：完成后流式校验，失败即报错（`errorCode=24`）
 - **令牌桶限速**：全局共享桶，10ms 粒度，最多攒 1 秒
 - **多源容错**：源轮转、失败累计禁用、探测失败源自动跳过、无 Range 服务器降级单流
@@ -30,7 +31,7 @@ cargo build --release
 ### 直连下载
 
 ```powershell
-gkdl <url> [-o <path>] [-s 8] [--max-speed <B/s>] [--sha256 <hex>] [--min-split-size <B>] [--retries <n>] [--post-script <script>]
+gkdl <url> [-o <path>] [-s 8] [--max-speed <B/s>] [--sha256 <hex>] [--min-split-size <B>] [--memory-threshold <B>] [--no-memory] [--retries <n>] [--post-script <script>]
 ```
 
 示例：
@@ -71,9 +72,13 @@ daemon:
 download:
   split: 8
   min_split_size: 262144
+  memory_threshold: 8388608   # 内存模式阈值（字节），0=禁用；上限 64MB
   max_speed: 0          # 0=不限
   retries: 3
   timeout: 30
+state:
+  db_path: state.db     # 状态库路径，相对路径基于配置目录解析
+  retention_days: 7     # 已完成/失败记录保留天数，0=永久保留
 log:
   level: info
   file: logs/gkdl.log

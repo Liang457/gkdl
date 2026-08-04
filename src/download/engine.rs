@@ -1,10 +1,12 @@
+use crate::app::db::{DownloadRecord, SegmentRecord, StateDb};
 use crate::download::config::DownloadConfig;
 use crate::download::mmap_writer::MmapWriter;
 use crate::download::rate_limit::TokenBucket;
-use crate::download::resume::{ResumeState, SegmentSnapshot};
 use crate::download::scheduler::WorkStealingScheduler;
+use crate::download::segment::{Segment, SegmentState};
 use crate::download::source::SourceManager;
 use crate::download::worker::DownloadWorker;
+use crate::download::writer::{DownloadWriter, MemoryWriter};
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::header::{ACCEPT_ENCODING, CONTENT_LENGTH, RANGE};
 use reqwest::{Client, StatusCode};
@@ -267,10 +269,43 @@ fn build_client(config: &DownloadConfig) -> Result<Client> {
         .context("HTTP 客户端构建失败")
 }
 
+/// 构造持久化任务记录（写入状态库）。
+#[allow(clippy::too_many_arguments)]
+fn make_record(
+    gid: &str,
+    urls: &[String],
+    total: u64,
+    out_path: &str,
+    sha256: &Option<String>,
+    cfg: &DownloadConfig,
+    memory_mode: bool,
+    status: &str,
+    segments: Vec<SegmentRecord>,
+) -> DownloadRecord {
+    let now = chrono::Utc::now().timestamp();
+    DownloadRecord {
+        gid: gid.to_string(),
+        urls: urls.to_vec(),
+        total,
+        out_path: out_path.to_string(),
+        sha256: sha256.clone(),
+        rate_limit: cfg.rate_limit,
+        split: cfg.split,
+        min_split_size: cfg.min_split_size,
+        memory_mode,
+        status: status.to_string(),
+        created_at: now,
+        updated_at: now,
+        segments,
+    }
+}
+
 /// 探测并启动后台下载。返回句柄后可 pause/resume/cancel/join。
 /// `cancel_token` 同时用于探测阶段与下载阶段；探测期间取消会立即中止。
 /// `limiter` 提供共享限速器（None 则按 config.rate_limit 新建）。
-/// `on_progress` 约每秒回调一次（在后台任务中执行）。
+/// `db` 为状态数据库（None 则不持久化、无法跨进程续传）；`gid` 为任务标识
+/// （None 则自动生成）。`on_progress` 约每秒回调一次（在后台任务中执行）。
+#[allow(clippy::too_many_arguments)]
 pub async fn start_download(
     urls: Vec<String>,
     out_path: Option<PathBuf>,
@@ -278,11 +313,14 @@ pub async fn start_download(
     sha256: Option<String>,
     limiter: Option<TokenBucket>,
     cancel_token: CancellationToken,
+    db: Option<Arc<StateDb>>,
+    gid: Option<String>,
     on_progress: impl Fn(Progress) + Send + Sync + 'static,
 ) -> Result<DownloadHandle> {
     if urls.is_empty() {
         bail!("未提供下载地址");
     }
+    let gid = gid.unwrap_or_else(crate::app::task_manager::TaskManager::gen_gid);
     let client = build_client(&config)?;
     let client = Arc::new(client);
 
@@ -323,74 +361,86 @@ pub async fn start_download(
         None => PathBuf::from(filename_from_url(&urls[0])),
     };
 
-    let control_path = ResumeState::control_path(&path);
+    // 内存模式判定：阈值 > 0 且文件大小在钳制后的阈值内
+    let current_opt = config.memory_threshold > 0
+        && probe.total
+            <= config
+                .memory_threshold
+                .min(crate::download::config::MEMORY_THRESHOLD_CAP);
 
-    // 续传前提：磁盘文件已存在、长度与探测一致，且服务器支持 Range。
-    // 若输出文件被删而 .gkdl 残留，直接续传会用全 0 占位并跳过 Complete 段 → 损坏；
+    // 磁盘续传前提：磁盘文件已存在、长度与探测一致，且服务器支持 Range。
+    // 若输出文件被删而记录残留，直接续传会用全 0 占位并跳过 Complete 段 → 损坏；
     // 无 Range 支持时 worker 只能整文件从头下载，无法按偏移续传。
     let file_ok = std::fs::metadata(&path)
         .map(|m| m.len() == probe.total)
         .unwrap_or(false);
 
-    // 尝试续传
+    // 尝试续传（查状态库）
+    let resume_record = db.as_ref().and_then(|db| {
+        db.find_resume(&path.display().to_string(), &urls, probe.total)
+            .ok()
+            .flatten()
+    });
+
     let mut resumed = false;
-    let scheduler = if control_path.exists() && probe.supports_range && file_ok {
-        match ResumeState::load(&control_path) {
-            Ok(state) if state.total == probe.total && state.urls == urls => {
-                let segments: Vec<crate::download::segment::Segment> = state
-                    .segments
-                    .iter()
-                    .map(|snap| {
-                        let mut s = crate::download::segment::Segment::new(
-                            0,
-                            snap.start,
-                            snap.end,
-                            config.speed_window,
-                        );
-                        s.written = snap.written;
-                        s.state = if snap.complete {
-                            crate::download::segment::SegmentState::Complete
-                        } else {
-                            crate::download::segment::SegmentState::Pending
-                        };
-                        s
-                    })
-                    .collect();
-                let completed_start: u64 = segments
-                    .iter()
-                    .filter(|s| s.state == crate::download::segment::SegmentState::Complete)
-                    .map(|s| s.written)
-                    .sum();
-                resumed = true;
-                tracing::info!(
-                    "检测到续传控制文件，从 {}/{} bytes 继续",
-                    completed_start,
-                    probe.total
-                );
-                Arc::new(WorkStealingScheduler::from_resume(segments, config.clone()))
-            }
-            _ => {
-                tracing::warn!("控制文件无效，重新开始下载");
-                Arc::new(WorkStealingScheduler::new(probe.total, config.clone()))
-            }
+    let mut memory_mode = current_opt;
+    let scheduler = if let Some(rec) = &resume_record {
+        // 空段表（历史残留/写入中断）下续传会让 all_done 恒真 → 全 0 占位文件被当作成功，必须重下
+        if !rec.memory_mode && probe.supports_range && file_ok && !rec.segments.is_empty() {
+            let segments: Vec<Segment> = rec
+                .segments
+                .iter()
+                .map(|snap| {
+                    let mut s = Segment::new(0, snap.start, snap.end, config.speed_window);
+                    s.written = snap.written;
+                    s.state = if snap.complete {
+                        SegmentState::Complete
+                    } else {
+                        SegmentState::Pending
+                    };
+                    s
+                })
+                .collect();
+            let completed_start: u64 = segments
+                .iter()
+                .filter(|s| s.state == SegmentState::Complete)
+                .map(|s| s.written)
+                .sum();
+            resumed = true;
+            memory_mode = false;
+            tracing::info!(
+                "检测到续传记录，从 {}/{} bytes 继续",
+                completed_start,
+                probe.total
+            );
+            WorkStealingScheduler::from_resume(segments, config.clone())
+        } else {
+            // 内存模式跨进程重启（数据只在 RAM，无法恢复已下字节）或续传条件不满足 → 重新下载
+            tracing::warn!("无法按段续传（内存模式重启/无 Range 支持/文件缺失），重新开始下载");
+            WorkStealingScheduler::new(probe.total, config.clone())
         }
     } else {
-        if control_path.exists() {
-            tracing::warn!("无法续传（文件缺失/大小不符或无 Range 支持），重新开始下载");
-        }
-        Arc::new(WorkStealingScheduler::new(probe.total, config.clone()))
+        WorkStealingScheduler::new(probe.total, config.clone())
     };
+    let scheduler = Arc::new(scheduler);
 
     tracing::info!(
-        "开始下载: {} -> {} ({} bytes, {} 线程{})",
+        "开始下载: {} -> {} ({} bytes, {} 线程{}, {})",
         urls[0],
         path.display(),
         probe.total,
         config.split,
-        if resumed { ", 续传模式" } else { "" }
+        if resumed { ", 续传模式" } else { "" },
+        if memory_mode {
+            "内存模式"
+        } else {
+            "磁盘模式"
+        }
     );
 
-    let writer = if resumed {
+    let writer: Arc<dyn DownloadWriter> = if memory_mode {
+        Arc::new(MemoryWriter::new(probe.total))
+    } else if resumed {
         Arc::new(MmapWriter::resume(&path, probe.total)?)
     } else {
         Arc::new(MmapWriter::new(&path, probe.total)?)
@@ -409,153 +459,208 @@ pub async fn start_download(
     let supports_range = probe.supports_range;
     let start = Instant::now();
 
-    // 后台任务：监控 + 保存控制文件 + workers + 校验
+    // 先落一次初始状态（探测完成、调度器就绪）
+    if let Some(db) = &db {
+        let segments: Vec<SegmentRecord> = scheduler
+            .segments()
+            .await
+            .iter()
+            .map(|s| SegmentRecord {
+                seg_id: s.seg_id,
+                start: s.start,
+                end: s.end,
+                written: s.written,
+                complete: s.state == SegmentState::Complete,
+            })
+            .collect();
+        let rec = make_record(
+            &gid,
+            &urls,
+            total,
+            &path.display().to_string(),
+            &sha256,
+            &config,
+            memory_mode,
+            "active",
+            segments,
+        );
+        if let Err(e) = db.upsert_download(&rec) {
+            tracing::warn!("写入初始下载状态失败: {}", e);
+        }
+    }
+
+    // 后台任务：监控 + 保存状态 + workers + 校验
     let sched_task = Arc::clone(&scheduler);
     let writer_task = Arc::clone(&writer);
     let source_mgr_task = Arc::clone(&source_mgr);
     let client_task = Arc::clone(&client);
     let cancel_task = cancel_token.clone();
-    let control_path_task = control_path.clone();
     let path_task = path.clone();
     let urls_task = urls.clone();
     let sha256_task = sha256.clone();
     let cfg_task = config.clone();
+    let db_task = db;
+    let gid_task = gid.clone();
 
     let join = tokio::spawn(async move {
-        // 进度监控 + 定期保存控制文件
-        let sched_clone = sched_task.clone();
-        let start_clone = start;
-        let control_path_clone = control_path_task.clone();
-        let urls_clone = urls_task.clone();
-        let sha256_clone = sha256_task.clone();
-        let cfg_clone = cfg_task.clone();
-        let out_path_str = path_task.display().to_string();
-        let cancel_clone = cancel_task.clone();
-        let monitor = tokio::spawn(async move {
-            // 立即上报一次初始进度（总长已知）
-            on_progress(Progress {
-                total,
-                completed: sched_clone.completed_bytes().await,
-                speed: 0.0,
-                connections: sched_clone.active_connections().await,
-            });
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                if cancel_clone.is_cancelled() || sched_clone.all_done().await {
-                    return;
-                }
-                let completed = sched_clone.completed_bytes().await;
-                let elapsed = start_clone.elapsed().as_secs_f64();
-                let speed = if elapsed > 0.0 {
-                    completed as f64 / elapsed
-                } else {
-                    0.0
-                };
+        let result: Result<DownloadReport> = (async {
+            // 进度监控 + 定期保存状态到数据库
+            let sched_clone = sched_task.clone();
+            let start_clone = start;
+            let urls_clone = urls_task.clone();
+            let sha256_clone = sha256_task.clone();
+            let cfg_clone = cfg_task.clone();
+            let out_path_str = path_task.display().to_string();
+            let cancel_clone = cancel_task.clone();
+            let gid_clone = gid_task.clone();
+            let db_clone = db_task.clone();
+            let monitor = tokio::spawn(async move {
+                // 立即上报一次初始进度（总长已知）
                 on_progress(Progress {
                     total,
-                    completed,
-                    speed,
+                    completed: sched_clone.completed_bytes().await,
+                    speed: 0.0,
                     connections: sched_clone.active_connections().await,
                 });
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if cancel_clone.is_cancelled() || sched_clone.all_done().await {
+                        return;
+                    }
+                    let completed = sched_clone.completed_bytes().await;
+                    let elapsed = start_clone.elapsed().as_secs_f64();
+                    let speed = if elapsed > 0.0 {
+                        completed as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+                    on_progress(Progress {
+                        total,
+                        completed,
+                        speed,
+                        connections: sched_clone.active_connections().await,
+                    });
 
-                // 保存控制文件
-                let segments: Vec<SegmentSnapshot> = sched_clone
+                    // 保存状态（段表）到数据库
+                    if let Some(db) = &db_clone {
+                        let segments: Vec<SegmentRecord> = sched_clone
+                            .segments()
+                            .await
+                            .iter()
+                            .map(|s| SegmentRecord {
+                                seg_id: s.seg_id,
+                                start: s.start,
+                                end: s.end,
+                                written: s.written,
+                                complete: s.state == SegmentState::Complete,
+                            })
+                            .collect();
+                        let rec = make_record(
+                            &gid_clone,
+                            &urls_clone,
+                            total,
+                            &out_path_str,
+                            &sha256_clone,
+                            &cfg_clone,
+                            memory_mode,
+                            "active",
+                            segments,
+                        );
+                        if let Err(e) = db.upsert_download(&rec) {
+                            tracing::warn!("保存下载状态失败: {}", e);
+                        }
+                    }
+                }
+            });
+
+            // 启动 workers
+            let mut handles = Vec::new();
+            for i in 0..cfg_task.split {
+                let worker = DownloadWorker::new(
+                    i,
+                    Arc::clone(&client_task),
+                    Arc::clone(&source_mgr_task),
+                    Arc::clone(&sched_task),
+                    Arc::clone(&writer_task),
+                    limiter_task.clone(),
+                    cfg_task.clone(),
+                    supports_range,
+                    cancel_task.clone(),
+                );
+                handles.push(tokio::spawn(async move { worker.run().await }));
+            }
+
+            for h in handles {
+                h.await.context("worker 协程异常退出")?;
+            }
+            monitor.abort();
+
+            if !sched_task.all_done().await {
+                let failed = sched_task
                     .segments()
                     .await
                     .iter()
-                    .map(|s| SegmentSnapshot {
-                        start: s.start,
-                        end: s.end,
-                        written: s.written,
-                        complete: s.state == crate::download::segment::SegmentState::Complete,
-                    })
-                    .collect();
-                let state = ResumeState {
-                    version: 1,
-                    urls: urls_clone.clone(),
-                    total,
-                    out_path: out_path_str.clone(),
-                    sha256: sha256_clone.clone(),
-                    rate_limit: cfg_clone.rate_limit,
-                    split: cfg_clone.split,
-                    min_split_size: cfg_clone.min_split_size,
-                    segments,
-                    updated_at: chrono::Utc::now().timestamp(),
-                };
-                if let Err(e) = state.save(&control_path_clone) {
-                    tracing::warn!("保存控制文件失败: {}", e);
+                    .filter(|s| s.state == SegmentState::Cancelled)
+                    .count();
+                bail!(
+                    "下载失败: {} 字节未完成（{} 个段失败）",
+                    sched_task.total_remaining().await,
+                    failed
+                );
+            }
+
+            writer_task.flush_all()?;
+            if memory_mode {
+                writer_task.finalize(&path_task)?;
+            }
+            drop(writer_task); // 释放 mmap/缓冲，便于读取校验
+
+            // SHA-256 校验
+            if let Some(expected) = &sha256_task {
+                tracing::info!("正在校验 SHA-256...");
+                crate::app::hash::verify_sha256(&path_task, expected)?;
+                tracing::info!("SHA-256 校验通过");
+            }
+
+            let report = DownloadReport {
+                path: path_task,
+                total,
+                elapsed: start.elapsed(),
+            };
+            Ok(report)
+        })
+        .await;
+
+        match result {
+            Ok(report) => {
+                if let Some(db) = &db_task {
+                    if let Err(e) = db.set_status(&gid_task, "complete") {
+                        tracing::warn!("标记任务完成失败: {}", e);
+                    }
                 }
+                tracing::info!(
+                    "下载完成: {} ({} bytes, 耗时 {:.2}s)",
+                    report.path.display(),
+                    report.total,
+                    report.elapsed.as_secs_f64()
+                );
+                Ok(report)
             }
-        });
-
-        // 启动 workers
-        let mut handles = Vec::new();
-        for i in 0..cfg_task.split {
-            let worker = DownloadWorker::new(
-                i,
-                Arc::clone(&client_task),
-                Arc::clone(&source_mgr_task),
-                Arc::clone(&sched_task),
-                Arc::clone(&writer_task),
-                limiter_task.clone(),
-                cfg_task.clone(),
-                supports_range,
-                cancel_task.clone(),
-            );
-            handles.push(tokio::spawn(async move { worker.run().await }));
-        }
-
-        for h in handles {
-            h.await.context("worker 协程异常退出")?;
-        }
-        monitor.abort();
-
-        if !sched_task.all_done().await {
-            let failed = sched_task
-                .segments()
-                .await
-                .iter()
-                .filter(|s| s.state == crate::download::segment::SegmentState::Cancelled)
-                .count();
-            bail!(
-                "下载失败: {} 字节未完成（{} 个段失败）",
-                sched_task.total_remaining().await,
-                failed
-            );
-        }
-
-        writer_task.flush_all()?;
-        drop(writer_task); // 释放 mmap，便于读取校验
-
-        // SHA-256 校验
-        if let Some(expected) = &sha256_task {
-            tracing::info!("正在校验 SHA-256...");
-            let result = crate::app::hash::verify_sha256(&path_task, expected);
-            if let Err(e) = result {
-                bail!("{e:#}");
-            }
-            tracing::info!("SHA-256 校验通过");
-        }
-
-        // 成功后删除控制文件
-        if control_path_task.exists() {
-            if let Err(e) = std::fs::remove_file(&control_path_task) {
-                tracing::warn!("删除控制文件失败: {}", e);
+            Err(e) => {
+                // 取消 → 保留记录为 paused（可续传）；其它失败 → error
+                let status = if cancel_task.is_cancelled() {
+                    "paused"
+                } else {
+                    "error"
+                };
+                if let Some(db) = &db_task {
+                    if let Err(e) = db.set_status(&gid_task, status) {
+                        tracing::warn!("标记任务状态失败: {}", e);
+                    }
+                }
+                Err(e)
             }
         }
-
-        let report = DownloadReport {
-            path: path_task,
-            total,
-            elapsed: start.elapsed(),
-        };
-        tracing::info!(
-            "下载完成: {} ({} bytes, 耗时 {:.2}s)",
-            report.path.display(),
-            report.total,
-            report.elapsed.as_secs_f64()
-        );
-        Ok(report)
     });
 
     Ok(DownloadHandle {
@@ -575,6 +680,7 @@ pub async fn download(
     out_path: Option<PathBuf>,
     config: DownloadConfig,
     sha256: Option<String>,
+    db: Option<Arc<StateDb>>,
     on_progress: impl Fn(Progress) + Send + Sync + 'static,
 ) -> Result<DownloadReport> {
     let handle = start_download(
@@ -584,6 +690,8 @@ pub async fn download(
         sha256,
         None,
         CancellationToken::new(),
+        db,
+        None,
         on_progress,
     )
     .await?;

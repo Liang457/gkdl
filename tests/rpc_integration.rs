@@ -2,6 +2,7 @@ mod common;
 
 use common::TestServer;
 use gkdl::app::config::{Config, ConfigStore};
+use gkdl::app::db::StateDb;
 use gkdl::app::hooks::HookConfig;
 use gkdl::app::task_manager::TaskManager;
 use gkdl::download::config::DownloadConfig;
@@ -49,7 +50,7 @@ async fn post_download_hook_runs_after_success() {
         commands_file: None,
         timeout_sec: 30,
     };
-    let mgr = TaskManager::new(hook, DownloadConfig::default());
+    let mgr = TaskManager::new(hook, DownloadConfig::default(), None);
     let gid = mgr
         .add_download(
             vec![server.url()],
@@ -81,7 +82,24 @@ async fn start_server(
     ShutdownHandle,
     tokio::sync::mpsc::UnboundedReceiver<ShutdownKind>,
 ) {
-    let mgr = TaskManager::new(HookConfig::default(), DownloadConfig::default());
+    // 内部使用内存数据库，便于驱动清理路径按新逻辑工作
+    let db = Arc::new(StateDb::open(std::path::Path::new(":memory:")).unwrap());
+    let (base, mgr, _db, shutdown, rx) = start_server_with_db(secret, Some(db)).await;
+    (base, mgr, shutdown, rx)
+}
+
+/// 带外部状态库的服务器（测试需要断言 DB 内容时使用）。
+async fn start_server_with_db(
+    secret: &str,
+    db: Option<Arc<StateDb>>,
+) -> (
+    String,
+    Arc<TaskManager>,
+    Option<Arc<StateDb>>,
+    ShutdownHandle,
+    tokio::sync::mpsc::UnboundedReceiver<ShutdownKind>,
+) {
+    let mgr = TaskManager::new(HookConfig::default(), DownloadConfig::default(), db.clone());
     let global = Arc::new(Mutex::new(GlobalOptions::default()));
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let shutdown = ShutdownHandle::new(tx);
@@ -96,7 +114,7 @@ async fn start_server(
     let addr = server::serve(state, "127.0.0.1", 0)
         .await
         .expect("serve 失败");
-    (format!("http://{addr}"), mgr, shutdown, rx)
+    (format!("http://{addr}"), mgr, db, shutdown, rx)
 }
 
 async fn call_raw(base: &str, body: &str) -> (reqwest::StatusCode, serde_json::Value) {
@@ -126,7 +144,7 @@ async fn change_global_option_persists_to_config_file() {
     let _ = std::fs::remove_file(&cfg_path);
     let store = ConfigStore::new(cfg_path.clone(), Config::default());
 
-    let mgr = TaskManager::new(HookConfig::default(), DownloadConfig::default());
+    let mgr = TaskManager::new(HookConfig::default(), DownloadConfig::default(), None);
     let global = Arc::new(Mutex::new(GlobalOptions::default()));
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let shutdown = ShutdownHandle::new(tx);
@@ -354,18 +372,6 @@ async fn wait_status(base: &str, gid: &str, want: &str, timeout_ms: u64) -> serd
     }
 }
 
-async fn wait_gone(path: &std::path::Path, timeout_ms: u64) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-    while path.exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "文件未删除: {}",
-            path.display()
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-}
-
 /// addUri 带选项，返回 gid。
 async fn add_uri_with_opts(
     base: &str,
@@ -466,33 +472,43 @@ async fn force_remove_deletes_control_and_partial_files() {
     let data: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
     let server = TestServer::start(data, false).await;
     let out = out_path("remove_it");
-    let control = format!("{}.gkdl", out.display());
     let _ = std::fs::remove_file(&out);
-    let _ = std::fs::remove_file(&control);
 
-    let (base, _mgr, _shutdown, _rx) = start_server("").await;
+    let db = Arc::new(StateDb::open(std::path::Path::new(":memory:")).unwrap());
+    let (base, _mgr, _db, _shutdown, _rx) = start_server_with_db("", Some(db.clone())).await;
 
     let gid = add_uri_with_opts(
         &base,
         &server.url(),
         &out,
-        serde_json::json!({ "max-download-limit": "131072" }),
+        serde_json::json!({
+            "max-download-limit": "131072",
+            "memory-threshold": "0", // 磁盘模式：下载中即有部分文件
+        }),
     )
     .await;
-    // 等控制文件出现（monitor 约 1s 保存一次）
+    // 等状态库出现记录（monitor 约 1s 保存一次）
     tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
     assert!(
-        std::path::Path::new(&control).exists(),
-        "下载中应存在控制文件"
+        db.load_download(&gid).unwrap().is_some(),
+        "下载中状态库应存在记录"
     );
-    assert!(out.exists(), "下载中应存在部分文件");
+    assert!(out.exists(), "磁盘模式下载中应存在部分文件");
 
     let v = call(&base, "aria2.forceRemove", serde_json::json!([gid])).await;
     assert_eq!(v["result"], "OK");
 
-    // driver 结束后删除控制文件与部分文件
-    wait_gone(&std::path::PathBuf::from(&control), 5000).await;
-    wait_gone(&out, 5000).await;
+    // driver 结束后删除状态库记录与部分文件
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5000);
+    while db.load_download(&gid).unwrap().is_some() || out.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "删除超时：记录={} 文件={}",
+            db.load_download(&gid).unwrap().is_some(),
+            out.exists()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 #[tokio::test]
@@ -543,18 +559,15 @@ async fn cancel_during_probe_cleans_up_and_does_not_reactivate() {
 
 #[tokio::test]
 async fn force_remove_with_slow_rate_limit_stops_engine_promptly() {
-    // 极低限速（102 B/s）下取消任务：引擎应立即退出并清理控制文件。
+    // 极低限速（102 B/s）下取消任务：引擎应立即退出并清理状态库记录。
     // 修复前 worker 卡死在 consume() 的 sleep 中（需 ~642s 才攒够一个分块），清理迟迟不发生。
     let data: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
     let server = TestServer::start(data, false).await;
     let out = out_path("slow_cancel_it");
-    let control = format!("{}.gkdl", out.display());
-    let tmp = format!("{}.gkdl.tmp", out.display());
     let _ = std::fs::remove_file(&out);
-    let _ = std::fs::remove_file(&control);
-    let _ = std::fs::remove_file(&tmp);
 
-    let (base, mgr, _shutdown, _rx) = start_server("").await;
+    let db = Arc::new(StateDb::open(std::path::Path::new(":memory:")).unwrap());
+    let (base, mgr, _db, _shutdown, _rx) = start_server_with_db("", Some(db.clone())).await;
 
     let gid = add_uri_with_opts(
         &base,
@@ -564,20 +577,23 @@ async fn force_remove_with_slow_rate_limit_stops_engine_promptly() {
     )
     .await;
 
-    // 等控制文件出现（monitor 约 1s 保存一次）
+    // 等状态库出现记录（monitor 约 1s 保存一次）
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     assert!(
-        std::path::Path::new(&control).exists(),
-        "下载中应存在控制文件"
+        db.load_download(&gid).unwrap().is_some(),
+        "下载中状态库应存在记录"
     );
 
     let v = call(&base, "aria2.forceRemove", serde_json::json!([gid])).await;
     assert_eq!(v["result"], "OK");
     assert!(mgr.get(&gid).is_none(), "任务应已从注册表移除");
 
-    // 取消后引擎应立即退出并清理控制文件
-    wait_gone(&std::path::PathBuf::from(&control), 5000).await;
-    wait_gone(&std::path::PathBuf::from(&tmp), 5000).await;
+    // 取消后引擎应立即退出并清理状态库记录
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5000);
+    while db.load_download(&gid).unwrap().is_some() {
+        assert!(std::time::Instant::now() < deadline, "状态库记录删除超时");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 
     let _ = std::fs::remove_file(&out);
 }

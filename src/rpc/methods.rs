@@ -41,6 +41,7 @@ fn str_bool(b: bool) -> Value {
 fn sync_global_to_config(cfg: &mut crate::app::config::Config, g: &GlobalOptions) {
     cfg.download.split = g.split;
     cfg.download.min_split_size = g.min_split_size;
+    cfg.download.memory_threshold = g.memory_threshold;
     cfg.download.max_retries = g.retries;
     cfg.download.timeout = g.timeout;
     cfg.download.piece_length = g.piece_length;
@@ -302,6 +303,7 @@ async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> R
                 "max-overall-download-limit": str_num(global.max_overall_download_limit),
                 "split": str_num(global.split as u64),
                 "min-split-size": str_num(global.min_split_size),
+                "memory-threshold": str_num(global.memory_threshold),
                 "max-tries": str_num(global.retries as u64),
                 "timeout": str_num(global.timeout),
                 "connect-timeout": str_num(global.timeout),
@@ -340,6 +342,11 @@ async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> R
             if let Some(v) = opts.get("min-split-size") {
                 if let Some(n) = v.as_str().and_then(parse_size) {
                     global.min_split_size = n;
+                }
+            }
+            if let Some(v) = opts.get("memory-threshold") {
+                if let Some(n) = v.as_str().and_then(parse_size) {
+                    global.memory_threshold = n;
                 }
             }
             if let Some(v) = opts.get("max-tries") {
@@ -479,6 +486,7 @@ async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> R
             let mut config = DownloadConfig {
                 split: global.split,
                 min_split_size: global.min_split_size,
+                memory_threshold: global.memory_threshold,
                 max_retries: global.retries,
                 timeout: global.timeout,
                 piece_length: global.piece_length,
@@ -506,6 +514,11 @@ async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> R
                 if let Some(s) = opts.get("min-split-size").and_then(|v| v.as_str()) {
                     if let Some(n) = parse_size(s) {
                         config.min_split_size = n;
+                    }
+                }
+                if let Some(s) = opts.get("memory-threshold").and_then(|v| v.as_str()) {
+                    if let Some(n) = parse_size(s) {
+                        config.memory_threshold = n;
                     }
                 }
                 if let Some(s) = opts.get("max-download-limit").and_then(|v| v.as_str()) {

@@ -1,7 +1,8 @@
+use crate::app::db::{DownloadRecord, StateDb};
 use crate::app::hooks::{self, HookConfig, HookContext};
 use crate::download::config::DownloadConfig;
 use crate::download::engine::{self, Progress};
-use crate::download::resume::ResumeState;
+use crate::download::rate_limit::TokenBucket;
 use anyhow::{anyhow, bail, Result};
 use rand::RngExt;
 use std::collections::HashMap;
@@ -174,10 +175,16 @@ pub struct TaskManager {
     hook: HookConfig,
     global_limiter: crate::download::rate_limit::TokenBucket,
     gate: ConcurrencyGate,
+    /// 状态数据库（None 则不做持久化/跨进程续传）
+    db: Option<Arc<StateDb>>,
 }
 
 impl TaskManager {
-    pub fn new(hook: HookConfig, _default_config: DownloadConfig) -> Arc<Self> {
+    pub fn new(
+        hook: HookConfig,
+        _default_config: DownloadConfig,
+        db: Option<Arc<StateDb>>,
+    ) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(128);
         Arc::new(Self {
             tasks: RwLock::new(HashMap::new()),
@@ -185,6 +192,7 @@ impl TaskManager {
             hook,
             global_limiter: crate::download::rate_limit::TokenBucket::new(0),
             gate: ConcurrencyGate::new(),
+            db,
         })
     }
 
@@ -214,6 +222,11 @@ impl TaskManager {
 
     pub fn subscribe(&self) -> broadcast::Receiver<TaskEvent> {
         self.events.subscribe()
+    }
+
+    /// 状态数据库引用（None 表示未启用持久化）。
+    pub fn db(&self) -> Option<Arc<StateDb>> {
+        self.db.clone()
     }
 
     pub fn get(&self, gid: &str) -> Option<Arc<Task>> {
@@ -250,7 +263,6 @@ impl TaskManager {
         } else {
             self.global_limiter.clone()
         };
-        let limiter_for_engine = limiter.clone();
 
         let task_token = CancellationToken::new();
         let task = Arc::new(Task {
@@ -280,9 +292,88 @@ impl TaskManager {
             .unwrap()
             .insert(gid.clone(), Arc::clone(&task));
 
+        self.spawn_driver(task, config, sha256, limiter).await;
+        Ok(gid)
+    }
+
+    /// 从状态库恢复中断任务（active/paused）。恢复后的任务进入「暂停」状态，
+    /// 不自动重启；用户 unpause 后驱动协程会按状态库记录续传（磁盘）或重下（内存）。
+    pub async fn rehydrate_from_db(self: &Arc<Self>) -> Result<usize> {
+        let Some(db) = &self.db else {
+            return Ok(0);
+        };
+        let records = db.list_resumable()?;
+        let mut count = 0usize;
+        for rec in records {
+            if self.get(&rec.gid).is_some() {
+                continue;
+            }
+            self.rehydrate_task(rec).await?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    async fn rehydrate_task(self: &Arc<Self>, rec: DownloadRecord) -> Result<()> {
+        // 用记录里的分片/限速参数重建配置（UA/超时等沿用默认值，续传时影响不大）
+        let config = DownloadConfig {
+            split: rec.split.max(1),
+            min_split_size: rec.min_split_size,
+            rate_limit: rec.rate_limit,
+            ..Default::default()
+        };
+        let limiter = if rec.rate_limit > 0 {
+            crate::download::rate_limit::TokenBucket::new(rec.rate_limit)
+        } else {
+            self.global_limiter.clone()
+        };
+        let completed = rec.completed_bytes();
+        let task_token = CancellationToken::new();
+        let task = Arc::new(Task {
+            gid: rec.gid.clone(),
+            urls: rec.urls.clone(),
+            out_path: PathBuf::from(&rec.out_path),
+            status: Mutex::new(TaskStatus::Paused),
+            total: AtomicU64::new(rec.total),
+            completed: AtomicU64::new(completed),
+            speed: AtomicU64::new(0),
+            connections: AtomicUsize::new(0),
+            error_code: AtomicI32::new(0),
+            error_message: Mutex::new(None),
+            sha256: rec.sha256.clone(),
+            created_at: rec.created_at,
+            scheduler: Mutex::new(None),
+            limiter: Mutex::new(None),
+            cancel_token: Mutex::new(None),
+            driver: Mutex::new(None),
+            rate_limit: AtomicU64::new(rec.rate_limit),
+            task_token,
+            resume_notify: Notify::new(),
+        });
+        let gid = rec.gid.clone();
+        self.tasks
+            .write()
+            .unwrap()
+            .insert(gid.clone(), Arc::clone(&task));
+        self.spawn_driver(task, config, rec.sha256, limiter).await;
+        tracing::info!("已恢复中断任务 {}（暂停，等待用户恢复）", gid);
+        Ok(())
+    }
+
+    /// 启动任务的驱动协程：等待并发槽位 → 启动引擎 → 监听状态/事件。
+    /// `task.status` 的初始值决定行为（Waiting 自动启动；Paused 等待 unpause）。
+    async fn spawn_driver(
+        self: &Arc<Self>,
+        task: Arc<Task>,
+        config: DownloadConfig,
+        sha256: Option<String>,
+        limiter: TokenBucket,
+    ) {
         let mgr = Arc::clone(self);
         let task_for_driver = Arc::clone(&task);
         let progress_task = Arc::clone(&task);
+        let urls = task.urls.clone();
+        let limiter_for_engine = limiter.clone();
         let driver = tokio::spawn(async move {
             // 等待并发槽位（max=0 立即通过）；排队期间被移除/取消则放弃。
             // 排队中被暂停的任务不占槽位，等 unpause 唤醒后再抢槽。
@@ -329,6 +420,8 @@ impl TaskManager {
                 sha256.clone(),
                 Some(limiter_for_engine),
                 ct,
+                mgr.db.clone(),
+                Some(task_for_driver.gid.clone()),
                 move |p: Progress| {
                     progress_task.total.store(p.total, Ordering::Relaxed);
                     progress_task
@@ -360,7 +453,7 @@ impl TaskManager {
             {
                 handle.cancel();
                 let _ = handle.join().await;
-                mgr.cleanup_incomplete_files(&task_for_driver);
+                mgr.cleanup_incomplete_files(&task_for_driver).await;
                 return;
             }
 
@@ -406,7 +499,7 @@ impl TaskManager {
 
             // 任务已被移除：清理控制文件与部分文件
             if *task_for_driver.status.lock().unwrap() == TaskStatus::Removed {
-                mgr.cleanup_incomplete_files(&task_for_driver);
+                mgr.cleanup_incomplete_files(&task_for_driver).await;
             }
 
             // 终态：释放调度器内的速度历史等临时内存（保留段表供 tellStatus 展示）
@@ -419,8 +512,6 @@ impl TaskManager {
             }
         });
         *task.driver.lock().unwrap() = Some(driver);
-
-        Ok(gid)
     }
 
     async fn finish_error(self: &Arc<Self>, task: &Arc<Task>, err: anyhow::Error) {
@@ -559,12 +650,13 @@ impl TaskManager {
         self.tasks.write().unwrap().remove(gid);
         if status != TaskStatus::Active {
             // 引擎不在运行，立即清理（Active 任务由 driver 结束后清理）
-            self.cleanup_incomplete_files(&task);
+            self.cleanup_incomplete_files(&task).await;
         }
         Ok(())
     }
 
-    /// 移除单个下载结果（stopped 任务）。未完成的任务同时清理临时文件。
+    /// 移除单个下载结果（stopped 任务）。未完成的任务同时清理临时文件；
+    /// 已完成/出错任务也一并删除状态库记录。
     pub async fn remove_download_result(&self, gid: &str) -> Result<()> {
         let task = self.get(gid).ok_or_else(|| anyhow!("GID {} 不存在", gid))?;
         if matches!(
@@ -573,22 +665,34 @@ impl TaskManager {
         ) {
             bail!("任务仍在队列或下载中");
         }
-        self.cleanup_incomplete_files(&task);
+        if let Some(db) = &self.db {
+            if let Err(e) = db.delete(gid) {
+                tracing::warn!("删除任务 {} 的状态记录失败: {}", gid, e);
+            }
+        }
+        self.cleanup_incomplete_files(&task).await;
         self.tasks.write().unwrap().remove(gid);
         Ok(())
     }
 
-    /// 清理未完成下载的临时文件：控制文件 + .gkdl.tmp + 部分文件。
+    /// 清理未完成下载的临时文件：状态库记录 + 残留控制文件 + 部分文件。
     /// 已完整下载的任务保留文件。
-    fn cleanup_incomplete_files(&self, task: &Task) {
+    async fn cleanup_incomplete_files(&self, task: &Task) {
         let total = task.total.load(Ordering::Relaxed);
         let completed = task.completed.load(Ordering::Relaxed);
         if total > 0 && completed >= total {
             return;
         }
-        let control = ResumeState::control_path(&task.out_path);
-        std::fs::remove_file(&control).ok();
-        std::fs::remove_file(control.with_extension("gkdl.tmp")).ok();
+        // 删除状态库记录（含段，级联）
+        if let Some(db) = &self.db {
+            if let Err(e) = db.delete(&task.gid) {
+                tracing::warn!("删除任务 {} 的状态记录失败: {}", task.gid, e);
+            }
+        }
+        // 清理旧版控制文件残留（新版本不再生成，仅防御性删除）
+        let legacy = PathBuf::from(format!("{}.gkdl", task.out_path.display()));
+        std::fs::remove_file(&legacy).ok();
+        std::fs::remove_file(legacy.with_extension("gkdl.tmp")).ok();
         std::fs::remove_file(&task.out_path).ok();
     }
 
@@ -607,6 +711,11 @@ impl TaskManager {
             .collect();
         let mut guard = self.tasks.write().unwrap();
         for gid in finished {
+            if let Some(db) = &self.db {
+                if let Err(e) = db.delete(&gid) {
+                    tracing::warn!("清除任务 {} 的状态记录失败: {}", gid, e);
+                }
+            }
             guard.remove(&gid);
         }
     }

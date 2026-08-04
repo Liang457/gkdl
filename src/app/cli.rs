@@ -117,6 +117,14 @@ pub struct DownloadArgs {
     #[arg(long)]
     pub min_split_size: Option<u64>,
 
+    /// 内存模式阈值（字节）：小于等于该值直接下载到内存，完成后原子落盘；0 或负值禁用
+    #[arg(long)]
+    pub memory_threshold: Option<u64>,
+
+    /// 禁用内存模式（等价 --memory-threshold 0）
+    #[arg(long)]
+    pub no_memory: bool,
+
     /// 单段最大重试次数
     #[arg(long)]
     pub retries: Option<u32>,
