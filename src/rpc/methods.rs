@@ -1,8 +1,8 @@
 use super::{GlobalOptions, GlobalOptionsRef, ShutdownHandle, ShutdownKind};
-use crate::config::ConfigStore;
+use crate::app::config::ConfigStore;
+use crate::app::task_manager::{Task, TaskManager, TaskStatus};
 use crate::download::config::DownloadConfig;
 use crate::download::segment::Segment;
-use crate::task_manager::{Task, TaskManager, TaskStatus};
 use anyhow::Result as AResult;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -38,7 +38,7 @@ fn str_bool(b: bool) -> Value {
 }
 
 /// 把运行时全局选项同步回 Config（用于 RPC 修改后写回 config.yaml）。
-fn sync_global_to_config(cfg: &mut crate::config::Config, g: &GlobalOptions) {
+fn sync_global_to_config(cfg: &mut crate::app::config::Config, g: &GlobalOptions) {
     cfg.download.split = g.split;
     cfg.download.min_split_size = g.min_split_size;
     cfg.download.max_retries = g.retries;
@@ -244,8 +244,6 @@ async fn tell_status(task: &Arc<Task>) -> Value {
         "belongsTo": "",
         "dir": dir,
         "files": files,
-        "bittorrent": {},
-        "infoHash": "",
     })
 }
 
@@ -271,11 +269,26 @@ async fn list_tasks_status(tasks: impl Iterator<Item = Arc<Task>>) -> Value {
     Value::Array(arr)
 }
 
+/// aria2.getVersion 对外声明的启用特性（统一开关）。
+///
+/// 已实现并声明：
+/// - `Async DNS`：tokio 异步 DNS
+/// - `GZip`：reqwest 已启用 gzip 解压（见 Cargo.toml 中 reqwest 的 `gzip` feature）
+/// - `HTTPS`：rustls
+/// - `Message Digest`：SHA-256 校验（src/app/hash.rs）
+/// - `XML-RPC`：JSON-RPC over HTTP/WebSocket
+///
+/// 尚未实现、故不声明（若日后实现，把对应字符串加进此数组即可对外启用）：
+/// - `BitTorrent`（含 magnet、tracker、DHT 等）
+/// - `Metalink`
+/// - `Firefox3 Cookie`
+pub const ENABLED_FEATURES: &[&str] = &["Async DNS", "GZip", "HTTPS", "Message Digest", "XML-RPC"];
+
 async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> RpcResult {
     match method {
         "aria2.getVersion" => Ok(json!({
             "version": env!("CARGO_PKG_VERSION"),
-            "enabledFeatures": ["Async DNS", "BitTorrent", "Firefox3 Cookie", "GZip", "HTTPS", "Message Digest", "Metalink", "XML-RPC"],
+            "enabledFeatures": ENABLED_FEATURES,
         })),
 
         "aria2.getSessionInfo" => Ok(json!({
@@ -847,6 +860,16 @@ mod tests {
         assert!(!check_token("abc", &[json!("abc")]));
     }
 
+    #[test]
+    fn enabled_features_are_honest() {
+        // 只声明已实现的能力；未实现的 BitTorrent/Metalink 等不得对外声称
+        for f in ENABLED_FEATURES {
+            assert!(!matches!(*f, "BitTorrent" | "Metalink" | "Firefox3 Cookie"));
+        }
+        assert!(ENABLED_FEATURES.contains(&"HTTPS"));
+        assert!(ENABLED_FEATURES.contains(&"Message Digest"));
+    }
+
     #[tokio::test]
     async fn tell_status_shape() {
         let task = Arc::new(Task {
@@ -883,6 +906,9 @@ mod tests {
         // 否则 AriaNg 会误判任务为"等待验证"而不显示下载速度
         assert!(obj.get("verifiedLength").is_none());
         assert!(obj.get("verifyIntegrityPending").is_none());
+        // 非 BT 任务不返回 bittorrent/infoHash，避免 AriaNg 误判为 BT 下载
+        assert!(obj.get("bittorrent").is_none());
+        assert!(obj.get("infoHash").is_none());
     }
 
     #[test]

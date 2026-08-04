@@ -1,7 +1,7 @@
+use crate::app::hooks::{self, HookConfig, HookContext};
 use crate::download::config::DownloadConfig;
 use crate::download::engine::{self, Progress};
 use crate::download::resume::ResumeState;
-use crate::hooks::{self, HookConfig, HookContext};
 use anyhow::{anyhow, bail, Result};
 use rand::RngExt;
 use std::collections::HashMap;

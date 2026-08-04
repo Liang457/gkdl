@@ -530,7 +530,7 @@ pub async fn start_download(
         // SHA-256 校验
         if let Some(expected) = &sha256_task {
             tracing::info!("正在校验 SHA-256...");
-            let result = crate::hash::verify_sha256(&path_task, expected);
+            let result = crate::app::hash::verify_sha256(&path_task, expected);
             if let Err(e) = result {
                 bail!("{e:#}");
             }

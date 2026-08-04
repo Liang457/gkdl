@@ -2,12 +2,6 @@
 //!
 //! 双模式：CLI 直连下载 + daemon 常驻（JSON-RPC + 系统托盘）。
 
-pub mod cli;
-pub mod config;
+pub mod app;
 pub mod download;
-pub mod hash;
-pub mod hooks;
-pub mod logging;
 pub mod rpc;
-pub mod task_manager;
-pub mod tray;

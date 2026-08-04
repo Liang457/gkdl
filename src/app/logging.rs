@@ -1,4 +1,4 @@
-use crate::config::LogConfig;
+use crate::app::config::LogConfig;
 use anyhow::{Context, Result};
 use chrono::Local;
 use std::fs::{File, OpenOptions};

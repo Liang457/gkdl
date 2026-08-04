@@ -1,12 +1,12 @@
 mod common;
 
 use common::TestServer;
-use gkdl::config::{Config, ConfigStore};
+use gkdl::app::config::{Config, ConfigStore};
+use gkdl::app::hooks::HookConfig;
+use gkdl::app::task_manager::TaskManager;
 use gkdl::download::config::DownloadConfig;
-use gkdl::hooks::HookConfig;
 use gkdl::rpc::server::{self, AppState};
 use gkdl::rpc::{GlobalOptions, ShutdownHandle, ShutdownKind};
-use gkdl::task_manager::TaskManager;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -255,6 +255,17 @@ async fn rpc_server_serves_aria2_methods() {
     let v = call(&base, "aria2.getVersion", serde_json::json!([])).await;
     assert!(v["result"]["version"].is_string());
     assert!(v["error"].is_null());
+    // 只声明已实现的能力，不得声称 BitTorrent/Metalink 等未实现特性
+    let features: Vec<_> = v["result"]["enabledFeatures"]
+        .as_array()
+        .expect("enabledFeatures 应为数组")
+        .iter()
+        .filter_map(|f| f.as_str())
+        .collect();
+    assert!(features.contains(&"HTTPS"));
+    assert!(features.contains(&"Message Digest"));
+    assert!(!features.contains(&"BitTorrent"));
+    assert!(!features.contains(&"Metalink"));
 
     // 鉴权失败：错误 token → 400 且延迟
     let t0 = std::time::Instant::now();
@@ -285,6 +296,9 @@ async fn rpc_server_serves_aria2_methods() {
     )
     .await;
     assert_eq!(v["result"]["gid"], gid);
+    // 非 BT 任务不返回 bittorrent/infoHash，避免 AriaNg 误判为 BT 下载
+    assert!(v["result"].get("bittorrent").is_none());
+    assert!(v["result"].get("infoHash").is_none());
 
     // getGlobalStat
     let v = call(
@@ -823,14 +837,14 @@ async fn max_concurrent_downloads_limits_concurrency() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert_eq!(
         mgr.get(&gid1).unwrap().status(),
-        gkdl::task_manager::TaskStatus::Active
+        gkdl::app::task_manager::TaskStatus::Active
     );
 
     // 任务2 应进入 waiting 队列
     let gid2 = add_uri_with_opts(&base, &server.url(), &out2, serde_json::json!({})).await;
     assert_eq!(
         mgr.get(&gid2).unwrap().status(),
-        gkdl::task_manager::TaskStatus::Waiting,
+        gkdl::app::task_manager::TaskStatus::Waiting,
         "槽位不足时任务2应在等待队列"
     );
 
@@ -839,7 +853,7 @@ async fn max_concurrent_downloads_limits_concurrency() {
     mgr.wait_finished(&gid2).await.expect("任务2失败");
     assert_eq!(
         mgr.get(&gid2).unwrap().status(),
-        gkdl::task_manager::TaskStatus::Complete
+        gkdl::app::task_manager::TaskStatus::Complete
     );
 
     let _ = std::fs::remove_file(&out1);
@@ -885,21 +899,21 @@ async fn removing_paused_queued_task_does_not_hang_driver() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert_eq!(
         mgr.get(&gid1).unwrap().status(),
-        gkdl::task_manager::TaskStatus::Active
+        gkdl::app::task_manager::TaskStatus::Active
     );
 
     // 任务2 进入 waiting 队列，然后暂停（排队中暂停）
     let gid2 = add_uri_with_opts(&base, &server.url(), &out2, serde_json::json!({})).await;
     assert_eq!(
         mgr.get(&gid2).unwrap().status(),
-        gkdl::task_manager::TaskStatus::Waiting
+        gkdl::app::task_manager::TaskStatus::Waiting
     );
     let task2 = mgr.get(&gid2).unwrap();
     let v = call(&base, "aria2.forcePause", serde_json::json!([gid2])).await;
     assert_eq!(v["result"], "OK");
     assert_eq!(
         mgr.get(&gid2).unwrap().status(),
-        gkdl::task_manager::TaskStatus::Paused,
+        gkdl::app::task_manager::TaskStatus::Paused,
         "任务2 应为排队中暂停"
     );
 
@@ -909,7 +923,7 @@ async fn removing_paused_queued_task_does_not_hang_driver() {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(
         mgr.get(&gid2).unwrap().status(),
-        gkdl::task_manager::TaskStatus::Paused,
+        gkdl::app::task_manager::TaskStatus::Paused,
         "任务2 应仍处于暂停（等 unpause）"
     );
 

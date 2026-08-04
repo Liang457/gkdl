@@ -95,7 +95,7 @@ async fn sha256_verification_passes_and_fails() {
     let out1 = out_path("hash_ok");
     let _ = std::fs::remove_file(&out1);
     let _ = std::fs::remove_file(format!("{}.gkdl", out1.display()));
-    let digest = gkdl::hash::sha256_file(&{
+    let digest = gkdl::app::hash::sha256_file(&{
         std::fs::write(&out1, &data).unwrap();
         out1.clone()
     })

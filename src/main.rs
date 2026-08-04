@@ -1,15 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use clap::Parser;
-use gkdl::cli::{Cli, Command, DaemonArgs};
-use gkdl::config::{self, ConfigStore, LogConfig};
+use gkdl::app::cli::{Cli, Command, DaemonArgs};
+use gkdl::app::config::{self, ConfigStore, LogConfig};
+use gkdl::app::hooks::HookConfig;
+use gkdl::app::logging;
+use gkdl::app::task_manager::{self, TaskManager};
+use gkdl::app::tray;
 use gkdl::download::config::DownloadConfig;
-use gkdl::hooks::HookConfig;
-use gkdl::logging;
 use gkdl::rpc;
 use gkdl::rpc::{GlobalOptions, ShutdownHandle, ShutdownKind};
-use gkdl::task_manager::{self, TaskManager};
-use gkdl::tray;
 use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 
@@ -148,7 +148,7 @@ fn print_rpc(resp: anyhow::Result<serde_json::Value>) -> i32 {
     }
 }
 
-async fn run_download(args: gkdl::cli::DownloadArgs) -> i32 {
+async fn run_download(args: gkdl::app::cli::DownloadArgs) -> i32 {
     let mut config = DownloadConfig {
         split: args.split.max(1),
         ..Default::default()

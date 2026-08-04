@@ -102,4 +102,4 @@ cargo test
 
 ## 设计文档
 
-见 `doc/`：多线程下载算法、慢线程处理、aria2 RPC 兼容规范、aria2 源码分析、PCL2 算法分析、实施计划。
+见 `doc/`：`design/` 下为内部设计（多线程下载算法、慢线程处理、实施计划），`reference/` 下为参考与源码分析（aria2 RPC 兼容规范、aria2 源码分析、PCL2 算法分析）。

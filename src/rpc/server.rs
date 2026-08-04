@@ -1,8 +1,8 @@
 use super::methods::{check_token, dispatch, MethodCtx};
 use super::protocol::{self, RpcOut};
 use super::{GlobalOptionsRef, ShutdownHandle};
-use crate::config::ConfigStore;
-use crate::task_manager::{TaskEvent, TaskManager};
+use crate::app::config::ConfigStore;
+use crate::app::task_manager::{TaskEvent, TaskManager};
 use anyhow::{Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::FromRequestParts;
