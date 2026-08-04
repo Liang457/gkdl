@@ -1,4 +1,8 @@
-# gkdl
+# gkdl — Cool-GK Downloader
+
+> **GKDL** 是 **Cool-GK Downloader** 的缩写，是一个用 Rust 编写的多线程下载器。
+
+> ⚠️ 个人项目，自用为主，不保证可用性；本仓库仅用于存放代码，不开放 issue / PR。
 
 Rust 实现的多线程下载器（Windows 可用），带 **aria2/AriaNg 兼容 JSON-RPC** 服务与 **系统托盘**。
 
@@ -103,3 +107,7 @@ cargo test
 ## 设计文档
 
 见 `doc/`：`design/` 下为内部设计（多线程下载算法、慢线程处理、实施计划），`reference/` 下为参考与源码分析（aria2 RPC 兼容规范、aria2 源码分析、PCL2 算法分析）。
+
+## 许可证
+
+MIT — 详见 `LICENSE` 文件。本项目仅供学习参考，使用/分发带来的任何后果由使用者自行承担。
