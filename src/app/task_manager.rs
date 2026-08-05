@@ -6,7 +6,7 @@ use crate::download::rate_limit::TokenBucket;
 use anyhow::{anyhow, bail, Result};
 use rand::RngExt;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::broadcast;
@@ -168,6 +168,20 @@ impl Drop for ConcurrencyPermit<'_> {
     }
 }
 
+/// 输出路径占用状态。
+///
+/// 多个任务可指向同一输出路径（默认按文件名解析）。记录当前占用该路径的任务，
+/// 以及该路径上是否已存在一份完整下载结果，用于防止「旧任务迟到的清理」误删
+/// 「新任务已下载完成」的文件。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PathOwnership {
+    /// 当前占用该输出路径的任务 GID（无占用者为 None）。
+    owner: Option<String>,
+    /// 该路径上是否已存在一份完整下载结果。新任务开始下载时清除；
+    /// 置位后任何其它任务的清理都不得删除该文件。
+    complete: bool,
+}
+
 /// 任务管理器：GID 任务表 + 状态机 + 事件广播 + 触发 hook。
 pub struct TaskManager {
     tasks: RwLock<HashMap<String, Arc<Task>>>,
@@ -177,6 +191,8 @@ pub struct TaskManager {
     gate: ConcurrencyGate,
     /// 状态数据库（None 则不做持久化/跨进程续传）
     db: Option<Arc<StateDb>>,
+    /// 输出路径占用状态（路径 → 属主/完成标记），防止误删共享路径的下载结果。
+    path_state: RwLock<HashMap<PathBuf, PathOwnership>>,
 }
 
 impl TaskManager {
@@ -193,6 +209,7 @@ impl TaskManager {
             global_limiter: crate::download::rate_limit::TokenBucket::new(0),
             gate: ConcurrencyGate::new(),
             db,
+            path_state: RwLock::new(HashMap::new()),
         })
     }
 
@@ -292,6 +309,8 @@ impl TaskManager {
             .unwrap()
             .insert(gid.clone(), Arc::clone(&task));
 
+        // 登记该任务对该输出路径的占用（清除旧的「已有完整结果」标记）
+        self.claim_path(&task.out_path, &gid);
         self.spawn_driver(task, config, sha256, limiter).await;
         Ok(gid)
     }
@@ -355,6 +374,7 @@ impl TaskManager {
             .write()
             .unwrap()
             .insert(gid.clone(), Arc::clone(&task));
+        self.claim_path(&task.out_path, &gid);
         self.spawn_driver(task, config, rec.sha256, limiter).await;
         tracing::info!("已恢复中断任务 {}（暂停，等待用户恢复）", gid);
         Ok(())
@@ -486,6 +506,8 @@ impl TaskManager {
                     task_for_driver
                         .completed
                         .store(report.total, Ordering::Relaxed);
+                    // 标记该路径已有完整结果：之后任何旧任务迟到的清理都不得删除此文件
+                    mgr.mark_path_complete(&task_for_driver.out_path, &task_for_driver.gid);
                     *task_for_driver.status.lock().unwrap() = TaskStatus::Complete;
                     let _ = mgr.events.send(TaskEvent::Complete {
                         gid: task_for_driver.gid.clone(),
@@ -509,6 +531,12 @@ impl TaskManager {
             };
             if let Some(sched) = sched {
                 sched.trim().await;
+            }
+            // 终态：收缩状态库 WAL 并释放页缓存，避免下载期间的段写入占用常驻内存
+            if let Some(db) = &mgr.db {
+                if let Err(e) = db.release_memory() {
+                    tracing::warn!("收缩状态库内存失败: {}", e);
+                }
             }
         });
         *task.driver.lock().unwrap() = Some(driver);
@@ -675,11 +703,61 @@ impl TaskManager {
         Ok(())
     }
 
+    /// 登记路径占用：新任务开始使用该输出路径（清除旧的「已有完整结果」标记）。
+    fn claim_path(&self, path: &Path, gid: &str) {
+        self.path_state.write().unwrap().insert(
+            path.to_path_buf(),
+            PathOwnership {
+                owner: Some(gid.to_string()),
+                complete: false,
+            },
+        );
+    }
+
+    /// 标记该路径已有完整下载结果（任务下载完成时调用）。
+    /// 此后其它任务（含旧任务迟到的清理）都不得删除该文件。
+    fn mark_path_complete(&self, path: &Path, gid: &str) {
+        let mut m = self.path_state.write().unwrap();
+        if let Some(s) = m.get_mut(path) {
+            if s.owner.as_deref() == Some(gid) {
+                s.complete = true;
+            }
+        }
+    }
+
+    /// 释放该任务对该路径的占用（保留 complete 标记，防止旧任务清理误删已完成文件）。
+    /// 无占用且无完整结果标记的条目已无意义，直接移除避免 path_state 长期驻留增长。
+    fn release_path(&self, path: &Path, gid: &str) {
+        let mut m = self.path_state.write().unwrap();
+        if let Some(s) = m.get_mut(path) {
+            if s.owner.as_deref() == Some(gid) {
+                s.owner = None;
+                if !s.complete {
+                    m.remove(path);
+                }
+            }
+        }
+    }
+
+    /// 判断本任务能否删除该路径下的文件：
+    /// 仅当该路径无「已有完整结果」标记，且当前占用者不是其它任务时才允许删除。
+    fn can_delete_path(&self, path: &Path, gid: &str) -> bool {
+        let m = self.path_state.read().unwrap();
+        match m.get(path) {
+            None => true,
+            Some(s) if s.complete => false,
+            Some(s) => s.owner.as_deref().is_none_or(|o| o == gid),
+        }
+    }
+
     /// 清理未完成下载的临时文件：状态库记录 + 残留控制文件 + 部分文件。
     /// 已完整下载的任务保留文件。
     async fn cleanup_incomplete_files(&self, task: &Task) {
         let total = task.total.load(Ordering::Relaxed);
         let completed = task.completed.load(Ordering::Relaxed);
+        // 先释放本任务的路径占用；释放后若该路径已被其它任务占用，
+        // 或已标记「完整结果」，则不得删除该路径下的文件。
+        self.release_path(&task.out_path, &task.gid);
         if total > 0 && completed >= total {
             return;
         }
@@ -693,12 +771,16 @@ impl TaskManager {
         let legacy = PathBuf::from(format!("{}.gkdl", task.out_path.display()));
         std::fs::remove_file(&legacy).ok();
         std::fs::remove_file(legacy.with_extension("gkdl.tmp")).ok();
-        std::fs::remove_file(&task.out_path).ok();
+        // 仅在确认该路径仍归属本任务（或已无占用且无完整结果）时删除输出文件，
+        // 防止旧任务迟到的清理误删新任务已下载完成的文件。
+        if self.can_delete_path(&task.out_path, &task.gid) {
+            std::fs::remove_file(&task.out_path).ok();
+        }
     }
 
     /// 清理已完成/出错/已移除的任务。
     pub async fn purge(&self) {
-        let finished: Vec<String> = self
+        let finished: Vec<Arc<Task>> = self
             .all_tasks()
             .into_iter()
             .filter(|t| {
@@ -707,16 +789,20 @@ impl TaskManager {
                     TaskStatus::Complete | TaskStatus::Error | TaskStatus::Removed
                 )
             })
-            .map(|t| t.gid.clone())
             .collect();
         let mut guard = self.tasks.write().unwrap();
-        for gid in finished {
+        for t in &finished {
             if let Some(db) = &self.db {
-                if let Err(e) = db.delete(&gid) {
-                    tracing::warn!("清除任务 {} 的状态记录失败: {}", gid, e);
+                if let Err(e) = db.delete(&t.gid) {
+                    tracing::warn!("清除任务 {} 的状态记录失败: {}", t.gid, e);
                 }
             }
-            guard.remove(&gid);
+            guard.remove(&t.gid);
+        }
+        drop(guard);
+        // 释放各任务对输出路径的占用（保留 complete 标记，避免旧清理误删已完成文件）
+        for t in &finished {
+            self.release_path(&t.out_path, &t.gid);
         }
     }
 
@@ -792,5 +878,59 @@ mod tests {
         let gid = TaskManager::gen_gid();
         assert_eq!(gid.len(), 16);
         assert!(gid.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn path_ownership_blocks_stale_cleanup() {
+        let mgr = TaskManager::new(HookConfig::default(), DownloadConfig::default(), None);
+        let f = PathBuf::from("C:/dl/f.bin");
+        let old = "aaaa000000000001";
+        let fresh = "bbbb000000000002";
+
+        // 任务 A 占用路径，其自己的清理允许删除
+        mgr.claim_path(&f, old);
+        assert!(mgr.can_delete_path(&f, old), "属主自身可删除自己的部分文件");
+
+        // 新任务接管路径后，旧任务的清理不得再删除该文件
+        mgr.claim_path(&f, fresh);
+        assert!(
+            !mgr.can_delete_path(&f, old),
+            "旧任务不得删除新任务占用路径下的文件"
+        );
+        assert!(mgr.can_delete_path(&f, fresh));
+
+        // 新任务下载完成后标记完整结果：任何其它任务的清理都不允许删除
+        mgr.mark_path_complete(&f, fresh);
+        assert!(
+            !mgr.can_delete_path(&f, old),
+            "存在完整结果时旧任务不得删除文件"
+        );
+        assert!(
+            !mgr.can_delete_path(&f, fresh),
+            "存在完整结果时即使属主也不应删除（由 complete 分支拦截）"
+        );
+
+        // 新任务被移除：释放占用，但 complete 标记保留 → 旧任务仍不能删除
+        mgr.release_path(&f, fresh);
+        assert!(
+            !mgr.can_delete_path(&f, old),
+            "释放后旧任务仍不得删除已有完整结果的文件"
+        );
+
+        // 新的下载再次接管：清除 complete 标记，其自身可删除，旧任务仍不可
+        mgr.claim_path(&f, "cccc000000000003");
+        assert!(mgr.can_delete_path(&f, "cccc000000000003"));
+        assert!(!mgr.can_delete_path(&f, old));
+
+        // 无占用且无完整结果的条目在释放时被移除 → 判定退回默认防御路径（允许删除）
+        mgr.release_path(&f, "cccc000000000003");
+        assert!(
+            mgr.can_delete_path(&f, old),
+            "释放后无占用且无完整结果，条目应被移除并允许删除"
+        );
+
+        // 无任何记录/占用的路径允许删除（旧版防御性清理路径）
+        let fresh_path = PathBuf::from("C:/dl/other.bin");
+        assert!(mgr.can_delete_path(&fresh_path, old));
     }
 }

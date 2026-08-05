@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 
-/// 写盘抽象：`MmapWriter`（预分配 + mmap）与 `MemoryWriter`（小文件内存模式）共用。
+/// 写盘抽象：`PwriteWriter`（预分配 + 偏移写）与 `MemoryWriter`（小文件内存模式）共用。
 ///
 /// 并发模型与旧版一致：各 worker 只写自己的非重叠区间，因此 `write_at` 无需同步。
 pub trait DownloadWriter: Send + Sync {
@@ -27,7 +27,7 @@ pub struct MemoryWriter {
 }
 
 // MemoryWriter 通过 `UnsafeCell` 提供内部可变性；并发安全由调用方
-// （scheduler 保证非重叠区间）约束，与 `MmapWriter` 的 mmap 语义一致。
+// （scheduler 保证非重叠区间）约束，与 `PwriteWriter` 的偏移写语义一致。
 unsafe impl Sync for MemoryWriter {}
 
 impl MemoryWriter {

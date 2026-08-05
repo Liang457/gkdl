@@ -348,6 +348,10 @@ async fn run_daemon(args: DaemonArgs) -> i32 {
                         }
                         Err(e) => tracing::warn!("清理过期任务记录失败: {e:#}"),
                     }
+                    // 无条件收缩 WAL 与页缓存，防止下载产生的大 WAL 常驻内存
+                    if let Err(e) = db.release_memory() {
+                        tracing::warn!("收缩状态库内存失败: {e:#}");
+                    }
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
             }

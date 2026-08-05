@@ -69,6 +69,9 @@ impl StateDb {
             .context("设置 synchronous 失败")?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .context("启用外键失败")?;
+        // 收紧页缓存，降低常驻内存（默认 2000 页 ≈ 8MB，这里压到 2MB）
+        conn.pragma_update(None, "cache_size", -2048)
+            .context("设置 cache_size 失败")?;
         Self::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -380,6 +383,15 @@ impl StateDb {
             let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         }
         Ok(deleted)
+    }
+
+    /// 下载终态调用：收缩 WAL 到空并释放页缓存中不再需要的帧，
+    /// 避免大文件下载期间积累的 WAL 页（默认最多 ~2000 页）常驻内存。
+    pub fn release_memory(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA shrink_memory;")
+            .context("收缩状态库内存失败")?;
+        Ok(())
     }
 }
 

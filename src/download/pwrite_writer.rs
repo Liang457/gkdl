@@ -1,20 +1,24 @@
 use crate::download::writer::DownloadWriter;
 use anyhow::{bail, Context, Result};
-use memmap2::MmapRaw;
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 
-/// 预分配 + mmap 写盘。
-/// 各 worker 只写自己的非重叠区间，因此 `write_at` 并发安全。
-pub struct MmapWriter {
-    mmap: Option<MmapRaw>,
+/// 预分配 + 偏移写盘（pwrite）。
+///
+/// 各 worker 只写自己的非重叠区间，因此 `write_at` 并发安全：
+/// Windows 用 overlapped `seek_write`（显式偏移，不共享文件指针），
+/// Unix 用等价的 `write_at`。
+///
+/// 与旧版整文件 mmap 相比，pwrite 的页面归属系统页缓存而非进程工作集，
+/// 大文件下载时进程工作集不再随文件大小虚高。
+pub struct PwriteWriter {
     file: File,
     total: u64,
     path: std::path::PathBuf,
 }
 
-impl MmapWriter {
-    /// 创建/截断文件并映射。`total == 0` 时不映射（空文件）。
+impl PwriteWriter {
+    /// 创建/截断文件并预分配 `total` 字节。
     pub fn new(path: &Path, total: u64) -> Result<Self> {
         Self::open(path, total, true)
     }
@@ -35,18 +39,7 @@ impl MmapWriter {
 
         file.set_len(total).with_context(|| "预分配文件失败")?;
 
-        let mmap = if total == 0 {
-            None
-        } else {
-            let map = MmapOptions::new()
-                .len(total as usize)
-                .map_raw(&file)
-                .with_context(|| "mmap 映射失败")?;
-            Some(map)
-        };
-
         Ok(Self {
-            mmap,
             file,
             total,
             path: path.to_path_buf(),
@@ -64,16 +57,11 @@ impl MmapWriter {
     }
 
     /// 把数据写入 offset 处。调用方必须保证区间不与其它并发写重叠。
-    ///
-    /// # Safety
-    /// 通过原始指针写入 mmap。所有调用方只写自己的非重叠字节区间，
-    /// 不存在数据竞争（这是本模块并发模型的先决条件，由 scheduler 保证）。
     pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
-        let offset = offset as usize;
-        if offset + data.len() > self.total as usize {
+        if offset.saturating_add(data.len() as u64) > self.total {
             bail!(
                 "写越界: offset={} len={} total={}",
                 offset,
@@ -81,53 +69,54 @@ impl MmapWriter {
                 self.total
             );
         }
-        if let Some(map) = &self.mmap {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    map.as_mut_ptr().add(offset),
-                    data.len(),
+        // 短写循环补齐：WriteFile 对普通文件通常一次写完，但仍需防御性处理
+        let mut written = 0usize;
+        while written < data.len() {
+            let n = self.pwrite(&data[written..], offset + written as u64)?;
+            if n == 0 {
+                bail!(
+                    "写入停滞: offset={} len={}",
+                    offset + written as u64,
+                    data.len() - written
                 );
             }
-        } else {
-            // total == 0 且要写数据：不可能，但保险起见用 file
-            use std::io::{Seek, SeekFrom, Write};
-            let mut f = &self.file;
-            f.seek(SeekFrom::Start(offset as u64))?;
-            f.write_all(data)?;
+            written += n;
         }
         Ok(())
     }
 
-    /// 刷新给定区间到磁盘。
-    pub fn flush_range(&self, offset: u64, len: u64) {
-        if let Some(map) = &self.mmap {
-            let _ = map.flush_range(offset as usize, len as usize);
+    /// 平台相关的偏移写：Windows 用 overlapped `seek_write`（等价 pwrite），Unix 用 `write_at`。
+    fn pwrite(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::FileExt::seek_write(&self.file, buf, offset)
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::FileExt::write_at(&self.file, buf, offset)
         }
     }
 
+    /// 刷新给定区间到磁盘（pwrite 已直接落 IO，无需额外刷新）。
+    pub fn flush_range(&self, _offset: u64, _len: u64) {}
+
     pub fn flush_all(&self) -> Result<()> {
-        if let Some(map) = &self.mmap {
-            map.flush().with_context(|| "mmap flush 失败")?;
-        }
         self.file.sync_all().with_context(|| "文件 sync 失败")?;
         Ok(())
     }
 }
 
-use memmap2::MmapOptions;
-
-impl DownloadWriter for MmapWriter {
+impl DownloadWriter for PwriteWriter {
     fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
-        MmapWriter::write_at(self, offset, data)
+        PwriteWriter::write_at(self, offset, data)
     }
 
     fn flush_range(&self, offset: u64, len: u64) {
-        MmapWriter::flush_range(self, offset, len);
+        PwriteWriter::flush_range(self, offset, len);
     }
 
     fn flush_all(&self) -> Result<()> {
-        MmapWriter::flush_all(self)
+        PwriteWriter::flush_all(self)
     }
 
     fn total(&self) -> u64 {
@@ -151,13 +140,13 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("gkdl_mmap_{}.tmp", ts))
+        std::env::temp_dir().join(format!("gkdl_pw_{}.tmp", ts))
     }
 
     #[test]
     fn write_and_read_back() {
         let p = tmp_path();
-        let writer = MmapWriter::new(&p, 100).unwrap();
+        let writer = PwriteWriter::new(&p, 100).unwrap();
         writer.write_at(0, b"hello").unwrap();
         writer.write_at(5, b" world").unwrap();
         writer.flush_all().unwrap();
@@ -174,7 +163,7 @@ mod tests {
     #[test]
     fn out_of_bounds_rejected() {
         let p = tmp_path();
-        let writer = MmapWriter::new(&p, 10).unwrap();
+        let writer = PwriteWriter::new(&p, 10).unwrap();
         assert!(writer.write_at(5, b"123456").is_err());
         drop(writer);
         std::fs::remove_file(&p).ok();
@@ -183,11 +172,37 @@ mod tests {
     #[test]
     fn empty_file_ok() {
         let p = tmp_path();
-        let writer = MmapWriter::new(&p, 0).unwrap();
+        let writer = PwriteWriter::new(&p, 0).unwrap();
         assert!(writer.write_at(0, &[]).is_ok());
         drop(writer);
         let meta = std::fs::metadata(&p).unwrap();
         assert_eq!(meta.len(), 0);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn concurrent_disjoint_writes_match_pwrite_contract() {
+        // 模拟两个 worker 写互不重叠区间（等价于 mmap 的前置条件）
+        let p = tmp_path();
+        let w = std::sync::Arc::new(PwriteWriter::new(&p, 1024).unwrap());
+        let mut handles = Vec::new();
+        for (lo, hi, byte) in [(0u64, 512u64, 1u8), (512, 1024, 2)] {
+            let w = std::sync::Arc::clone(&w);
+            handles.push(std::thread::spawn(move || {
+                for i in lo..hi {
+                    w.write_at(i, &[byte]).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        drop(w);
+        let mut f = File::open(&p).unwrap();
+        let mut buf = vec![0u8; 1024];
+        f.read_exact(&mut buf).unwrap();
+        assert!(buf[..512].iter().all(|&b| b == 1));
+        assert!(buf[512..].iter().all(|&b| b == 2));
         std::fs::remove_file(&p).ok();
     }
 }

@@ -1,3 +1,4 @@
+use crate::app::db::SegmentRecord;
 use crate::download::config::DownloadConfig;
 use crate::download::detector::{SlowThreadDetector, Verdict};
 use crate::download::segment::{Segment, SegmentState};
@@ -137,6 +138,22 @@ impl WorkStealingScheduler {
 
     pub async fn segments(&self) -> Vec<Segment> {
         self.segments.lock().await.clone()
+    }
+
+    /// 供持久化使用的轻量段快照：只取库表所需字段，不克隆 `speed_history` 等运行时数据，
+    /// 避免监控协程每秒全量克隆造成堆分配抖动。
+    pub async fn segment_records(&self) -> Vec<SegmentRecord> {
+        let guard = self.segments.lock().await;
+        guard
+            .iter()
+            .map(|s| SegmentRecord {
+                seg_id: s.seg_id,
+                start: s.start,
+                end: s.end,
+                written: s.written,
+                complete: s.state == SegmentState::Complete,
+            })
+            .collect()
     }
 
     pub async fn total_remaining(&self) -> u64 {

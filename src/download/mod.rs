@@ -2,7 +2,7 @@ pub mod config;
 pub mod curl;
 pub mod detector;
 pub mod engine;
-pub mod mmap_writer;
+pub mod pwrite_writer;
 pub mod rate_limit;
 pub mod scheduler;
 pub mod segment;

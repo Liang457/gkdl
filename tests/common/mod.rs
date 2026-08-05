@@ -138,7 +138,7 @@ async fn handle_conn(
         return;
     }
 
-    if path != "/file.bin" && path != "/slow" {
+    if path != "/file.bin" && path != "/slow" && path != "/hang_download" {
         respond(
             &mut socket,
             "404 Not Found",
@@ -192,7 +192,7 @@ async fn handle_conn(
     }
 
     match range {
-        Some((start, end)) if !ignore_range => {
+        Some((start, end)) if !ignore_range && path != "/hang_download" => {
             let slice = &data[start as usize..=end as usize];
             let headers = format!(
                 "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
@@ -203,6 +203,20 @@ async fn handle_conn(
             );
             let _ = socket.write_all(headers.as_bytes()).await;
             let _ = socket.write_all(slice).await;
+        }
+        _ if path == "/hang_download" => {
+            // 探测请求（Range: bytes=0-0）正常响应，其余请求挂起不响应，
+            // 用于模拟「服务器卡死/迟迟不返回」使旧任务引擎停在半途。
+            if range == Some((0, 0)) {
+                let headers = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/{}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                    data.len()
+                );
+                let _ = socket.write_all(headers.as_bytes()).await;
+                let _ = socket.write_all(&data[..1]).await;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            }
         }
         _ => {
             // 200 全量

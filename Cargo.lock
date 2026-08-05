@@ -1069,7 +1069,6 @@ dependencies = [
  "futures-util",
  "hex",
  "idna",
- "memmap2",
  "muda",
  "rand 0.10.2",
  "rusqlite",

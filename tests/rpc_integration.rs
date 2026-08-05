@@ -660,6 +660,76 @@ async fn force_remove_with_slow_rate_limit_stops_engine_promptly() {
 }
 
 #[tokio::test]
+async fn removed_task_late_cleanup_does_not_delete_newer_download() {
+    // 回归场景：A 源（探测成功但下载请求挂起）下载中途 forceRemove，清理被推迟到
+    // driver（引擎仍卡在挂起的连接上）；随后用 B 源下载同一路径并成功完成。
+    // 修复前 A 的迟到清理会按自身 total/completed 判定未完成而误删 B 已完成的文件。
+    let data: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
+    let server = TestServer::start(data.clone(), false).await;
+    let hang_url = format!("http://{}/hang_download", server.addr);
+    let out = out_path("late_cleanup_it");
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(format!("{}.gkdl", out.display()));
+
+    let db = Arc::new(StateDb::open(std::path::Path::new(":memory:")).unwrap());
+    let (base, mgr, _db, _shutdown, _rx) = start_server_with_db("", Some(db.clone())).await;
+
+    // 任务1：A 源。内存模式（不持有文件句柄，模拟小文件默认场景）+ 短读超时
+    // （min 5s），保证其 worker 在挂起连接上最多 5s 后超时退出，从而让「迟到清理」
+    // 稳定发生在 B 下载完成之后。
+    let gid_a = add_uri_with_opts(
+        &base,
+        &hang_url,
+        &out,
+        serde_json::json!({ "timeout": "5" }),
+    )
+    .await;
+
+    // 等任务1进入 active 且状态库出现记录（探测完成、下载请求已发出）
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(8000);
+    loop {
+        let v = call(&base, "aria2.tellStatus", serde_json::json!([gid_a])).await;
+        if v["result"]["status"] == "active" && db.load_download(&gid_a).unwrap().is_some() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "任务1未进入 active");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // 任务1 强制移除：文件清理被推迟到 driver（引擎仍卡在挂起的下载请求上）
+    let v = call(&base, "aria2.forceRemove", serde_json::json!([gid_a])).await;
+    assert_eq!(v["result"], "OK");
+
+    // 任务2：B 源正常下载同一路径并完成（小文件默认内存模式）
+    let gid_b = add_uri_with_opts(
+        &base,
+        &server.url(),
+        &out,
+        serde_json::json!({ "split": "2" }),
+    )
+    .await;
+    mgr.wait_finished(&gid_b).await.expect("B 源下载失败");
+
+    // 等任务1 的 driver 完成迟到清理（其状态库记录被删除）
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(15000);
+    while db.load_download(&gid_a).unwrap().is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "任务1的迟到清理未完成"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // 关键断言：任务2 下载完成的文件必须仍然存在且内容完整
+    assert!(out.exists(), "旧任务迟到清理误删了新任务的下载文件");
+    let bytes = std::fs::read(&out).unwrap();
+    assert_eq!(bytes, data, "下载文件内容被破坏");
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(format!("{}.gkdl", out.display()));
+}
+
+#[tokio::test]
 async fn tell_status_reports_piece_info() {
     let data: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
     let server = TestServer::start(data, false).await;

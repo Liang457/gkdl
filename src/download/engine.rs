@@ -1,7 +1,7 @@
 use crate::app::db::{DownloadRecord, SegmentRecord, StateDb};
 use crate::download::config::DownloadConfig;
 use crate::download::curl::{HttpClient, ProbeInfo};
-use crate::download::mmap_writer::MmapWriter;
+use crate::download::pwrite_writer::PwriteWriter;
 use crate::download::rate_limit::TokenBucket;
 use crate::download::scheduler::WorkStealingScheduler;
 use crate::download::segment::{Segment, SegmentState};
@@ -336,9 +336,9 @@ pub async fn start_download(
     let writer: Arc<dyn DownloadWriter> = if memory_mode {
         Arc::new(MemoryWriter::new(probe.total))
     } else if resumed {
-        Arc::new(MmapWriter::resume(&path, probe.total)?)
+        Arc::new(PwriteWriter::resume(&path, probe.total)?)
     } else {
-        Arc::new(MmapWriter::new(&path, probe.total)?)
+        Arc::new(PwriteWriter::new(&path, probe.total)?)
     };
     let source_mgr = Arc::new(SourceManager::new(&urls));
     for u in &failed_urls {
@@ -356,18 +356,7 @@ pub async fn start_download(
 
     // 先落一次初始状态（探测完成、调度器就绪）
     if let Some(db) = &db {
-        let segments: Vec<SegmentRecord> = scheduler
-            .segments()
-            .await
-            .iter()
-            .map(|s| SegmentRecord {
-                seg_id: s.seg_id,
-                start: s.start,
-                end: s.end,
-                written: s.written,
-                complete: s.state == SegmentState::Complete,
-            })
-            .collect();
+        let segments: Vec<SegmentRecord> = scheduler.segment_records().await;
         let rec = make_record(
             &gid,
             &urls,
@@ -438,18 +427,7 @@ pub async fn start_download(
 
                     // 保存状态（段表）到数据库
                     if let Some(db) = &db_clone {
-                        let segments: Vec<SegmentRecord> = sched_clone
-                            .segments()
-                            .await
-                            .iter()
-                            .map(|s| SegmentRecord {
-                                seg_id: s.seg_id,
-                                start: s.start,
-                                end: s.end,
-                                written: s.written,
-                                complete: s.state == SegmentState::Complete,
-                            })
-                            .collect();
+                        let segments: Vec<SegmentRecord> = sched_clone.segment_records().await;
                         let rec = make_record(
                             &gid_clone,
                             &urls_clone,
@@ -508,7 +486,7 @@ pub async fn start_download(
             if memory_mode {
                 writer_task.finalize(&path_task)?;
             }
-            drop(writer_task); // 释放 mmap/缓冲，便于读取校验
+            drop(writer_task); // 释放文件句柄，便于读取校验
 
             // SHA-256 校验
             if let Some(expected) = &sha256_task {

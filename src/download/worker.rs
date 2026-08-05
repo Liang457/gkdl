@@ -419,12 +419,12 @@ use crate::download::scheduler::FailureAction;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::download::mmap_writer::MmapWriter;
+    use crate::download::pwrite_writer::PwriteWriter;
 
     #[test]
     fn write_buffer_flushes_contiguously() {
         let p = std::env::temp_dir().join("gkdl_wbuf.tmp");
-        let writer: Arc<dyn DownloadWriter> = Arc::new(MmapWriter::new(&p, 1024).unwrap());
+        let writer: Arc<dyn DownloadWriter> = Arc::new(PwriteWriter::new(&p, 1024).unwrap());
         let mut buf = WriteBuffer::new(Arc::clone(&writer), 64);
         buf.write(0, &[1u8; 40]).unwrap();
         assert_eq!(buf.buf.len(), 40);
