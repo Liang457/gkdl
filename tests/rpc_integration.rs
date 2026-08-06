@@ -398,6 +398,40 @@ async fn rpc_server_serves_aria2_methods() {
     .await;
     assert_eq!(v["result"]["status"], "complete");
 
+    // 第二个任务：验证 tellStopped(-1)（AriaNg 默认调用）返回全部 stopped、最新在前。
+    // 等待 >1s 确保 created_at 不同秒，避免排序歧义。
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let out2 = out_path("rpc_it_2");
+    let _ = std::fs::remove_file(&out2);
+    let v = call(
+        &base,
+        "aria2.addUri",
+        serde_json::json!([
+            "token:s3cret",
+            [server.url()],
+            {
+                "dir": out2.parent().unwrap().display().to_string(),
+                "out": out2.file_name().unwrap().to_string_lossy()
+            }
+        ]),
+    )
+    .await;
+    let gid2 = v["result"].as_str().expect("addUri 应返回 gid").to_string();
+    mgr.wait_finished(&gid2).await.expect("第二个任务失败");
+
+    let v = call(
+        &base,
+        "aria2.tellStopped",
+        serde_json::json!(["token:s3cret", -1, 1000]),
+    )
+    .await;
+    let stopped = v["result"].as_array().expect("tellStopped 应返回数组");
+    assert_eq!(stopped.len(), 2, "tellStopped(-1) 应返回全部 stopped 任务");
+    assert_eq!(stopped[0]["gid"], gid2, "最新完成的任务应排在前面");
+    assert_eq!(stopped[0]["status"], "complete");
+    assert_eq!(stopped[1]["gid"], gid, "最早的任务应在后面");
+    let _ = std::fs::remove_file(&out2);
+
     // 未知方法
     let v = call(&base, "aria2.nope", serde_json::json!(["token:s3cret"])).await;
     assert_eq!(v["error"]["code"], 1);

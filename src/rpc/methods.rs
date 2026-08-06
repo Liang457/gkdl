@@ -627,7 +627,8 @@ async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> R
                     )
                 })
                 .collect();
-            stopped.sort_by_key(|t| std::cmp::Reverse(t.created_at));
+            // aria2 存储序：最旧在前，负 offset 分页在 apply_range 内逆序（最新在前）
+            stopped.sort_by_key(|t| t.created_at);
             let slice = apply_range(stopped, offset, num);
             Ok(list_tasks_status(slice.into_iter()).await)
         }
@@ -852,21 +853,40 @@ pub const ALL_METHODS: [&str; 30] = [
     "system.listNotifications",
 ];
 
+/// 与 aria2 `getPaginationRange` 一致的分页语义（输入按存储序=最旧在前）：
+/// - `num <= 0`：返回空；
+/// - `offset >= 0`：跳过前 offset 条取 num 条（保持存储序）；
+/// - `offset < 0`：从尾部倒数取 num 条，最后整体逆序返回（最新在前）。
 fn apply_range(mut items: Vec<Arc<Task>>, offset: i64, num: i64) -> Vec<Arc<Task>> {
-    let start = if offset < 0 {
-        (items.len() as i64 + offset).max(0) as usize
-    } else {
-        offset as usize
-    };
-    if start >= items.len() {
+    if num <= 0 {
         return Vec::new();
     }
-    let end = if num < 0 {
-        items.len()
-    } else {
-        (start + num as usize).min(items.len())
-    };
-    items.drain(start..end).collect()
+    let size = items.len() as i64;
+    let reverse = offset < 0;
+    let (mut offset, mut num) = (offset, num);
+    if offset < 0 {
+        let tempoffset = offset + size;
+        if tempoffset < 0 {
+            return Vec::new();
+        }
+        offset = tempoffset - (num - 1);
+        if offset < 0 {
+            offset = 0;
+            num = tempoffset + 1;
+        }
+    } else if size <= offset {
+        return Vec::new();
+    }
+    // 用饱和加法防止恶意超大 num 与 offset 相加时 i64 溢出（溢出后 drain 会 panic）
+    let end = offset.saturating_add(num);
+    let last_distance = if size < end { size } else { end };
+    let mut out: Vec<_> = items
+        .drain(offset as usize..last_distance as usize)
+        .collect();
+    if reverse {
+        out.reverse();
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1063,5 +1083,95 @@ mod tests {
         };
         let (_, bf) = piece_bitfield(&[seg], 4 * 1024 * 1024, 1024 * 1024);
         assert_eq!(bf, "8");
+    }
+
+    fn mk_task(gid: &str, created_at: i64) -> Arc<Task> {
+        Arc::new(Task {
+            gid: gid.into(),
+            urls: Vec::new(),
+            out_path: std::path::PathBuf::from("C:/dl/f.zip"),
+            status: std::sync::Mutex::new(TaskStatus::Complete),
+            total: std::sync::atomic::AtomicU64::new(0),
+            completed: std::sync::atomic::AtomicU64::new(0),
+            speed: std::sync::atomic::AtomicU64::new(0),
+            connections: std::sync::atomic::AtomicUsize::new(0),
+            error_code: std::sync::atomic::AtomicI32::new(0),
+            error_message: std::sync::Mutex::new(None),
+            sha256: None,
+            created_at,
+            scheduler: std::sync::Mutex::new(None),
+            limiter: std::sync::Mutex::new(None),
+            cancel_token: std::sync::Mutex::new(None),
+            driver: std::sync::Mutex::new(None),
+            rate_limit: std::sync::atomic::AtomicU64::new(0),
+            task_token: tokio_util::sync::CancellationToken::new(),
+            resume_notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn gids(tasks: &[Arc<Task>]) -> Vec<&str> {
+        tasks.iter().map(|t| t.gid.as_str()).collect()
+    }
+
+    #[test]
+    fn pagination_offset_negative_returns_all_newest_first() {
+        // aria2 存储序最旧在前；tellStopped(-1, 1000)（AriaNg 默认）应返回全部、最新在前
+        let items = vec![mk_task("a", 1), mk_task("b", 2), mk_task("c", 3)];
+        let r = apply_range(items, -1, 1000);
+        assert_eq!(gids(&r), vec!["c", "b", "a"]);
+    }
+
+    #[test]
+    fn pagination_offset_negative_take_last_num() {
+        let items = vec![mk_task("a", 1), mk_task("b", 2), mk_task("c", 3)];
+        // offset=-1, num=2：取尾部 2 条（b、c）并逆序 → c、b
+        let r = apply_range(items, -1, 2);
+        assert_eq!(gids(&r), vec!["c", "b"]);
+
+        let items = vec![mk_task("a", 1), mk_task("b", 2), mk_task("c", 3)];
+        // offset=-1, num=1：只取最新一条
+        let r = apply_range(items, -1, 1);
+        assert_eq!(gids(&r), vec!["c"]);
+    }
+
+    #[test]
+    fn pagination_offset_non_negative_keeps_storage_order() {
+        // offset=0：全部、保持存储序（最旧在前）
+        let items = vec![mk_task("a", 1), mk_task("b", 2), mk_task("c", 3)];
+        let r = apply_range(items, 0, 1000);
+        assert_eq!(gids(&r), vec!["a", "b", "c"]);
+
+        // offset=1, num=1 → 仅第二条
+        let items = vec![mk_task("a", 1), mk_task("b", 2), mk_task("c", 3)];
+        let r = apply_range(items, 1, 1);
+        assert_eq!(gids(&r), vec!["b"]);
+
+        // offset 越界 → 空
+        let items = vec![mk_task("a", 1), mk_task("b", 2)];
+        let r = apply_range(items, 5, 10);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn pagination_edge_cases() {
+        // num <= 0 → 空
+        let items = vec![mk_task("a", 1), mk_task("b", 2)];
+        assert!(apply_range(items, 0, 0).is_empty());
+        let items = vec![mk_task("a", 1), mk_task("b", 2)];
+        assert!(apply_range(items, 0, -5).is_empty());
+
+        // 空列表 + 负 offset → 空
+        let items = Vec::new();
+        assert!(apply_range(items, -1, 100).is_empty());
+
+        // 单个元素 + 负 offset
+        let items = vec![mk_task("a", 1)];
+        let r = apply_range(items, -1, 1000);
+        assert_eq!(gids(&r), vec!["a"]);
+
+        // 恶意超大 num 不得溢出 i64（offset+num 饱和），应返回 offset 起的所有元素
+        let items = vec![mk_task("a", 1), mk_task("b", 2), mk_task("c", 3)];
+        let r = apply_range(items, 1, i64::MAX);
+        assert_eq!(gids(&r), vec!["b", "c"]);
     }
 }
