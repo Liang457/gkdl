@@ -140,3 +140,7 @@ gkdl/
 ## 许可证
 
 MIT，详见 LICENSE。
+
+## 致谢
+
+核心下载算法受 [aria2](https://github.com/aria2/aria2) 与 [PCL2](https://github.com/Hex-Dragon/PCL2) 启发，在此表示感谢。
