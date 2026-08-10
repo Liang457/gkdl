@@ -275,8 +275,6 @@ async fn list_tasks_status(tasks: impl Iterator<Item = Arc<Task>>) -> Value {
 ///
 /// 已实现并声明：
 /// - `Threaded DNS`：curl 线程化异步 DNS
-/// - `HTTPS`：libcurl (Schannel TLS)
-/// - `HTTP/2`：libnghttp2
 /// - `Message Digest`：SHA-256 校验（src/app/hash.rs）
 /// - `XML-RPC`：JSON-RPC over HTTP/WebSocket
 ///
@@ -289,26 +287,23 @@ async fn list_tasks_status(tasks: impl Iterator<Item = Arc<Task>>) -> Value {
 /// - `Firefox3 Cookie`
 ///
 /// 运行时还会在此列表之后追加 libcurl/TLS/zlib/nghttp2 的库版本条目（见
-/// [`enabled_features`]），AriaNg 会把数组逐项原样渲染到"已启用功能"。
-pub const ENABLED_FEATURES: &[&str] = &[
-    "Threaded DNS",
-    "HTTPS",
-    "HTTP/2",
-    "Message Digest",
-    "XML-RPC",
-];
+/// [`enabled_features`]），AriaNg 会把数组逐项原样渲染到"已启用功能"。其中
+/// `TLS: <后端>`、`nghttp2 <版本>` 取代了静态 `HTTPS` / `HTTP/2`（避免重叠）。
+pub const ENABLED_FEATURES: &[&str] = &["Threaded DNS", "Message Digest", "XML-RPC"];
 
 /// nghttp2 版本号编码为 `major<<16 | minor<<8 | patch`，拆成 `x.y.z` 可读形式。
 fn fmt_version_num(n: u32) -> String {
     format!("{}.{}.{}", n >> 16, (n >> 8) & 0xff, n & 0xff)
 }
 
-/// 组装 getVersion 对外声明的特性列表：静态 [`ENABLED_FEATURES`] + 运行时库版本信息。
+/// 组装 getVersion 对外声明的特性列表：静态 [`ENABLED_FEATURES`] + 运行时库版本信息
+/// （`libcurl <版本>`、`TLS: <后端>`、`zlib <版本>`、`nghttp2 <版本>`）。
+/// TLS 后端与 nghttp2 版本取代静态 `HTTPS` / `HTTP/2`，列表无重叠。
 fn enabled_features() -> Vec<String> {
     curl::init();
     let mut v: Vec<String> = ENABLED_FEATURES.iter().map(|s| (*s).to_string()).collect();
     let vinfo = curl::Version::get();
-    v.push(format!("libcurl {}", curl::Version::num()));
+    v.push(format!("libcurl {}", vinfo.version()));
     if let Some(s) = vinfo.ssl_version() {
         v.push(format!("TLS: {s}"));
     }
@@ -373,7 +368,8 @@ async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> R
             }
             if let Some(v) = opts.get("split") {
                 if let Some(n) = v.as_str().and_then(|s| s.parse::<usize>().ok()) {
-                    global.split = n;
+                    // 0 会令引擎不派生任何 worker 而挂死，钳制为至少 1
+                    global.split = n.max(1);
                 }
             }
             if let Some(v) = opts.get("min-split-size") {
@@ -526,7 +522,7 @@ async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> R
             let opts = params.get(1).and_then(|v| v.as_object());
             let global = ctx.global.lock().await;
             let mut config = DownloadConfig {
-                split: global.split,
+                split: global.split.max(1),
                 min_split_size: global.min_split_size,
                 memory_threshold: global.memory_threshold,
                 max_retries: global.retries,
@@ -947,14 +943,19 @@ mod tests {
         for f in ENABLED_FEATURES {
             assert!(!matches!(*f, "BitTorrent" | "Metalink" | "Firefox3 Cookie"));
         }
-        assert!(ENABLED_FEATURES.contains(&"HTTPS"));
+        assert!(ENABLED_FEATURES.contains(&"Threaded DNS"));
         assert!(ENABLED_FEATURES.contains(&"Message Digest"));
+        // TLS / HTTP/2 不再作为静态条目，改由运行时 TLS: / nghttp2 版本条目取代
+        assert!(!ENABLED_FEATURES.contains(&"HTTPS"));
+        assert!(!ENABLED_FEATURES.contains(&"HTTP/2"));
     }
 
     #[test]
     fn enabled_features_include_runtime_versions() {
         let f = enabled_features();
         assert!(f.iter().any(|s| s.starts_with("libcurl ")));
+        assert!(f.iter().any(|s| s.starts_with("TLS: ")));
+        assert!(f.iter().any(|s| s.starts_with("zlib ")));
         assert!(f.iter().any(|s| s.starts_with("nghttp2 ")));
         assert!(!f
             .iter()
@@ -962,7 +963,10 @@ mod tests {
         // 版本号只放纯数字，不带多余前缀
         assert!(f
             .iter()
-            .any(|s| s == &format!("libcurl {}", curl::Version::num())));
+            .any(|s| s == &format!("libcurl {}", curl::Version::get().version())));
+        // 静态特性名不再重复声明 HTTPS / HTTP/2（已由 TLS / nghttp2 版本条目取代）
+        assert!(!f.iter().any(|s| s == "HTTPS"));
+        assert!(!f.iter().any(|s| s == "HTTP/2"));
     }
 
     #[tokio::test]

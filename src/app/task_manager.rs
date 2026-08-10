@@ -283,6 +283,9 @@ impl TaskManager {
         config: DownloadConfig,
         sha256: Option<String>,
     ) -> Result<String> {
+        if urls.is_empty() {
+            bail!("未提供下载地址");
+        }
         let gid = Self::gen_gid();
         let out_path_resolved =
             out_path.unwrap_or_else(|| PathBuf::from(engine::filename_from_url(&urls[0])));

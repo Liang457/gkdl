@@ -383,7 +383,7 @@ impl DownloadWorker {
                 return ChunkAction::Outcome(SegOutcome::Failed);
             }
             self.scheduler
-                .update_progress(seg.seg_id, seg.written)
+                .update_progress(seg.seg_id, seg.written, None)
                 .await;
             return ChunkAction::Outcome(SegOutcome::Paused);
         }
@@ -412,10 +412,10 @@ impl DownloadWorker {
             seg.tick_bytes = 0;
             *last_tick = now;
 
-            // 同步进度到调度器，并获取被工作窃取截短后的段尾
+            // 同步进度与速度采样到调度器，并获取被工作窃取截短后的段尾
             if let Some(cur_end) = self
                 .scheduler
-                .update_progress(seg.seg_id, seg.written)
+                .update_progress(seg.seg_id, seg.written, Some(speed))
                 .await
             {
                 if cur_end < seg.end {

@@ -450,7 +450,8 @@ files, bittorrent, infoHash
 
 > ℹ️ **GKDL 扩展**：`enabledFeatures` 中除 aria2 特性名外，还会在末尾附加运行时库版本条目
 > （`libcurl <版本>`、`TLS: <后端>`、`zlib <版本>`、`nghttp2 <版本>`），AriaNg 会把它们
-> 原样渲染到"已启用功能"区域。
+> 原样渲染到"已启用功能"区域。其中 `TLS: <后端>`、`nghttp2 <版本>` 取代静态
+> `HTTPS` / `HTTP/2`，列表不重叠。
 
 `enabledFeatures` 列表（来自 `FeatureConfig.cc:115-189`）：
 

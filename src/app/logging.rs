@@ -84,14 +84,16 @@ impl RotatingFileWriter {
     }
 
     fn write_bytes(&self, buf: &[u8]) -> io::Result<usize> {
-        let current = self.current_size.load(Ordering::Relaxed);
-        if current + buf.len() as u64 > self.max_size {
-            self.rotate();
-        }
+        // 大小检查与轮转必须在同一把锁内完成：否则并发写入会同时越过阈值、
+        // 触发两次 rotate（二次重命名丢失一份备份）甚至互相覆盖文件句柄。
         let mut file = self
             .file
             .lock()
             .map_err(|_| io::Error::other("日志锁 poisoned"))?;
+        let current = self.current_size.load(Ordering::Relaxed);
+        if current + buf.len() as u64 > self.max_size {
+            self.rotate_locked(&mut file);
+        }
         let n = file.write(buf)?;
         self.current_size.fetch_add(n as u64, Ordering::Relaxed);
         Ok(n)
@@ -104,9 +106,9 @@ impl RotatingFileWriter {
         Ok(())
     }
 
-    fn rotate(&self) {
-        // gkdl.log → .1 → .2 → ... → .N，丢弃最旧
-        let _ = self.file.lock().map(|mut f| f.flush());
+    /// 轮转（调用方须已持有文件锁）：gkdl.log → .1 → .2 → ... → .N，丢弃最旧。
+    fn rotate_locked(&self, file: &mut File) {
+        let _ = file.flush();
         for i in (1..=self.backup_count).rev() {
             let from = self.rotate_name(i - 1);
             let to = self.rotate_name(i);
@@ -117,7 +119,7 @@ impl RotatingFileWriter {
                 let _ = std::fs::rename(&from, &to);
             }
         }
-        let file = OpenOptions::new()
+        let new_file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
@@ -131,9 +133,7 @@ impl RotatingFileWriter {
                     .open(&self.path)
                     .expect("日志文件完全无法访问")
             });
-        if let Ok(mut f) = self.file.lock() {
-            *f = file;
-        }
+        *file = new_file;
         self.current_size.store(0, Ordering::Relaxed);
     }
 

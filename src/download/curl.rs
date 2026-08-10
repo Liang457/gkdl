@@ -206,6 +206,12 @@ impl HttpClient {
         easy.follow_location(true)?;
         easy.max_redirections(10)?;
         easy.connect_timeout(Duration::from_secs(self.timeout.max(5)))?;
+        // 低速兜底：服务器长时间无数据传输（卡死/静默）时，让阻塞线程自行退出。
+        // 否则 async 侧读超时放弃段、接收端被丢弃后，spawn_blocking 里的 curl 仍会
+        // 阻塞在 recv() 上无期限地占用一个 blocking 线程（泄漏）。语义与 async 侧
+        // 「两次 chunk 间隔超时」一致：正常传输有数据流动不会触发。
+        easy.low_speed_limit(1)?;
+        easy.low_speed_time(Duration::from_secs(self.timeout.max(5)))?;
         Ok(easy)
     }
 

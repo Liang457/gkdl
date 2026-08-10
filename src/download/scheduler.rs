@@ -279,7 +279,9 @@ impl WorkStealingScheduler {
             return None;
         }
         let remaining = slowest.remaining();
-        let cut_size = (remaining as f64 * config.steal_ratio) as u64;
+        // 钳制窃取比例到 (0,1]：越界值会让 cut_size >= remaining，导致
+        // slowest.end - cut_size 下溢（debug panic / release 回绕成巨大偏移的段）。
+        let cut_size = (remaining as f64 * config.steal_ratio.clamp(0.0, 1.0)) as u64;
         let cut_point = slowest.end - cut_size;
 
         let mut new_seg = Segment::new(seg_id, cut_point, slowest.end, config.speed_window);
@@ -332,14 +334,26 @@ impl WorkStealingScheduler {
         self.detector.lock().await.clear(worker_id);
     }
 
-    /// 同步 worker 已写字节到调度器（供进度展示与续传）。
+    /// 同步 worker 已写字节与速度采样到调度器（供进度展示、续传与慢线程检测）。
     /// 返回调度器当前的段尾：工作窃取可能截短 end，worker 据此钳制本地进度。
-    pub async fn update_progress(&self, seg_id: u64, written: u64) -> Option<u64> {
+    ///
+    /// worker 只持有段的本地克隆，若不把速度采样回写，调度器侧的 `speed_history`
+    /// 永远是空的——`check_slow` 的对等节点与 `find_slowest` 就拿不到真实速度，
+    /// 慢线程杀停与「窃取最慢段」都会退化为永远 Healthy / 任选一段。
+    pub async fn update_progress(
+        &self,
+        seg_id: u64,
+        written: u64,
+        speed: Option<f64>,
+    ) -> Option<u64> {
         let mut guard = self.segments.lock().await;
         if let Some(t) = guard.iter_mut().find(|s| s.seg_id == seg_id) {
             if t.state == SegmentState::Downloading {
                 let max_written = t.end.saturating_sub(t.start);
                 t.written = t.written.max(written).min(max_written);
+                if let Some(speed) = speed {
+                    t.record_speed(speed);
+                }
                 return Some(t.end);
             }
         }
@@ -653,5 +667,24 @@ mod tests {
         // worker 3 来查找最慢段，应返回 seg1（速度 50）
         let idx = WorkStealingScheduler::find_slowest(&segs, 3, &config).unwrap();
         assert_eq!(idx, 1);
+    }
+
+    #[tokio::test]
+    async fn update_progress_records_speed_samples_to_scheduler() {
+        // 回归：worker 只持有段的本地克隆，若 update_progress 不把速度采样回写，
+        // 调度器侧的 speed_history 永远是空的，check_slow 的对等节点与 find_slowest
+        // 拿不到真实速度，慢线程杀停与「窃取最慢段」永久失效。
+        let sched = WorkStealingScheduler::new(1_000_000, cfg());
+        sched.steal_or_checkout(0).await.unwrap(); // seg0 -> Downloading
+        for i in 0..6 {
+            sched.update_progress(0, 100 * i, Some(50.0)).await;
+        }
+        let segs = sched.segments().await;
+        assert_eq!(segs[0].speed_history.len(), 6, "速度采样应回写到调度器");
+        assert_eq!(segs[0].avg_speed(), 50.0);
+        // 无采样（如暂停路径）不应清空既有历史
+        sched.update_progress(0, 600, None).await;
+        let segs = sched.segments().await;
+        assert_eq!(segs[0].speed_history.len(), 6);
     }
 }

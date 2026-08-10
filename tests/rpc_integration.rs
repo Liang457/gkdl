@@ -346,12 +346,16 @@ async fn rpc_server_serves_aria2_methods() {
         .iter()
         .filter_map(|f| f.as_str())
         .collect();
-    assert!(features.contains(&"HTTPS"));
+    assert!(features.contains(&"Threaded DNS"));
     assert!(features.contains(&"Message Digest"));
     assert!(!features.contains(&"BitTorrent"));
     assert!(!features.contains(&"Metalink"));
-    // 附加运行时库版本信息（libcurl/TLS/zlib/nghttp2）
+    // 附加运行时库版本信息（libcurl/TLS/zlib/nghttp2），并取代静态 HTTPS/HTTP/2
     assert!(features.iter().any(|f| f.contains("libcurl")));
+    assert!(features.iter().any(|f| f.starts_with("TLS: ")));
+    assert!(features.iter().any(|f| f.starts_with("nghttp2 ")));
+    assert!(!features.contains(&"HTTPS"));
+    assert!(!features.contains(&"HTTP/2"));
 
     // 鉴权失败：错误 token → 400 且延迟
     let t0 = std::time::Instant::now();

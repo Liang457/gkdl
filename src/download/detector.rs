@@ -23,10 +23,12 @@ pub enum Verdict {
 impl SlowThreadDetector {
     pub fn new(config: &DownloadConfig) -> Self {
         Self {
-            ratio: config.slow_ratio,
+            // 钳制到合法区间：负 grace_period 会让 Duration::from_secs_f64 panic；
+            // 越界 ratio 会破坏阈值判定（负阈值使慢线程检测失效）。
+            ratio: config.slow_ratio.clamp(0.0, 1.0),
             confirm_count: config.slow_confirm,
             min_samples: config.slow_min_samples,
-            grace_period: Duration::from_secs_f64(config.grace_period),
+            grace_period: Duration::from_secs_f64(config.grace_period.max(0.0)),
             strikes: HashMap::new(),
             birth_time: HashMap::new(),
         }

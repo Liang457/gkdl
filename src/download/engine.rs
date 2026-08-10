@@ -494,8 +494,10 @@ pub async fn start_download(
                 }
             });
 
-            // 启动 workers：流式模式只允许单连接（防窃取破坏顺序流）
-            let worker_count = if streaming { 1 } else { cfg_task.split };
+            // 启动 workers：流式模式只允许单连接（防窃取破坏顺序流）。
+            // split 可能被外部配置为 0（YAML/RPC 直传），调度器 internal_split 已用
+            // max(1) 兜底，这里同样钳制，否则 0 个 worker 会让 all_done 永不成立而挂死。
+            let worker_count = if streaming { 1 } else { cfg_task.split.max(1) };
             let mut handles = Vec::new();
             for i in 0..worker_count {
                 let worker = DownloadWorker::new(
