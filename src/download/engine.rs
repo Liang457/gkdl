@@ -7,7 +7,7 @@ use crate::download::scheduler::WorkStealingScheduler;
 use crate::download::segment::{Segment, SegmentState};
 use crate::download::source::SourceManager;
 use crate::download::worker::DownloadWorker;
-use crate::download::writer::{DownloadWriter, MemoryWriter};
+use crate::download::writer::{DownloadWriter, MemoryWriter, StreamingWriter};
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -116,6 +116,16 @@ async fn probe(
     // 用 GET Range: bytes=0-0 权威探测总长与 Range 支持
     // （有些服务器 HEAD 谎报 Accept-Ranges，必须实测）
     client.probe(url, cancel, timeout).await
+}
+
+/// 判定是否走「整文件流式 + gzip/deflate」路径：仅当允许压缩且该下载无法/无需分段时。
+pub fn should_use_streaming(probe: &ProbeInfo, config: &DownloadConfig) -> bool {
+    if !config.allow_compression {
+        return false;
+    }
+    !probe.supports_range
+        || !probe.total_known
+        || probe.total < config.min_split_size.max(1).saturating_mul(2)
 }
 
 /// 从 URL 提取文件名（百分号解码）。
@@ -242,6 +252,16 @@ pub async fn start_download(
     if !probe.supports_range {
         config.split = 1;
     }
+    // 流式（压缩）路径：允许压缩且该下载无法/无需分段。
+    // 探测拿不到大小且不允许流式 → 保持原有的「无法获取文件大小」错误语义。
+    let streaming = should_use_streaming(&probe, &config);
+    if !probe.total_known && !config.allow_compression {
+        bail!("无法获取文件大小");
+    }
+    // 流式模式恒为单连接，纠正 split 便于日志/状态库记录与实际一致
+    if streaming {
+        config.split = 1;
+    }
 
     let path = match out_path {
         Some(p) => {
@@ -270,16 +290,24 @@ pub async fn start_download(
         .map(|m| m.len() == probe.total)
         .unwrap_or(false);
 
-    // 尝试续传（查状态库）
-    let resume_record = db.as_ref().and_then(|db| {
-        db.find_resume(&path.display().to_string(), &urls, probe.total)
-            .ok()
-            .flatten()
-    });
+    // 尝试续传（查状态库）；流式/压缩下载无法按偏移续传，跳过
+    let resume_record = if streaming {
+        None
+    } else {
+        db.as_ref().and_then(|db| {
+            db.find_resume(&path.display().to_string(), &urls, probe.total)
+                .ok()
+                .flatten()
+        })
+    };
 
     let mut resumed = false;
     let mut memory_mode = current_opt;
-    let scheduler = if let Some(rec) = &resume_record {
+    let scheduler = if streaming {
+        // 流式：单段顺序流，已知总长为解压后大小，未知则用 u64::MAX（流结束即完成）
+        memory_mode = false;
+        WorkStealingScheduler::streaming(config.clone(), probe.total_known.then_some(probe.total))
+    } else if let Some(rec) = &resume_record {
         // 空段表（历史残留/写入中断）下续传会让 all_done 恒真 → 全 0 占位文件被当作成功，必须重下
         if !rec.memory_mode && probe.supports_range && file_ok && !rec.segments.is_empty() {
             let segments: Vec<Segment> = rec
@@ -328,12 +356,16 @@ pub async fn start_download(
         if resumed { ", 续传模式" } else { "" },
         if memory_mode {
             "内存模式"
+        } else if streaming {
+            "流式模式(压缩)"
         } else {
             "磁盘模式"
         }
     );
 
-    let writer: Arc<dyn DownloadWriter> = if memory_mode {
+    let writer: Arc<dyn DownloadWriter> = if streaming {
+        Arc::new(StreamingWriter::new(&path)?)
+    } else if memory_mode {
         Arc::new(MemoryWriter::new(probe.total))
     } else if resumed {
         Arc::new(PwriteWriter::resume(&path, probe.total)?)
@@ -446,9 +478,10 @@ pub async fn start_download(
                 }
             });
 
-            // 启动 workers
+            // 启动 workers：流式模式只允许单连接（防窃取破坏顺序流）
+            let worker_count = if streaming { 1 } else { cfg_task.split };
             let mut handles = Vec::new();
-            for i in 0..cfg_task.split {
+            for i in 0..worker_count {
                 let worker = DownloadWorker::new(
                     i,
                     Arc::clone(&client_task),
@@ -458,6 +491,7 @@ pub async fn start_download(
                     limiter_task.clone(),
                     cfg_task.clone(),
                     supports_range,
+                    streaming,
                     cancel_task.clone(),
                 );
                 handles.push(tokio::spawn(async move { worker.run().await }));
@@ -482,8 +516,14 @@ pub async fn start_download(
                 );
             }
 
+            // 流式模式报告实际已写字节（未知大小/压缩流的真实文件大小）
+            let report_total = if streaming {
+                writer_task.total()
+            } else {
+                total
+            };
             writer_task.flush_all()?;
-            if memory_mode {
+            if memory_mode || streaming {
                 writer_task.finalize(&path_task)?;
             }
             drop(writer_task); // 释放文件句柄，便于读取校验
@@ -497,7 +537,7 @@ pub async fn start_download(
 
             let report = DownloadReport {
                 path: path_task,
-                total,
+                total: report_total,
                 elapsed: start.elapsed(),
             };
             Ok(report)
@@ -581,5 +621,63 @@ mod tests {
         assert_eq!(filename_from_url("https://a.com/b/c.zip?x=1"), "c.zip");
         assert_eq!(filename_from_url("https://a.com/b/"), "download.bin");
         assert_eq!(filename_from_url("https://a.com/%E6%B5%8B.txt"), "测.txt");
+    }
+
+    fn cfg_with_compression(on: bool) -> DownloadConfig {
+        DownloadConfig {
+            min_split_size: 256 * 1024,
+            allow_compression: on,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn streaming_when_no_range() {
+        let probe = ProbeInfo {
+            total: 10 * 1024 * 1024,
+            total_known: true,
+            supports_range: false,
+        };
+        assert!(should_use_streaming(&probe, &cfg_with_compression(true)));
+        // 不允许压缩时回退到原有单流降级
+        assert!(!should_use_streaming(&probe, &cfg_with_compression(false)));
+    }
+
+    #[test]
+    fn streaming_when_size_unknown() {
+        let probe = ProbeInfo {
+            total: 0,
+            total_known: false,
+            supports_range: false,
+        };
+        assert!(should_use_streaming(&probe, &cfg_with_compression(true)));
+        assert!(!should_use_streaming(&probe, &cfg_with_compression(false)));
+    }
+
+    #[test]
+    fn streaming_when_small_file() {
+        let probe = ProbeInfo {
+            total: 128 * 1024, // < 2 * min_split_size
+            total_known: true,
+            supports_range: true,
+        };
+        assert!(should_use_streaming(&probe, &cfg_with_compression(true)));
+        // 边界：恰好 2 倍最小分片 → 仍可分段，不流式
+        let probe2 = ProbeInfo {
+            total: 512 * 1024,
+            total_known: true,
+            supports_range: true,
+        };
+        assert!(!should_use_streaming(&probe2, &cfg_with_compression(true)));
+    }
+
+    #[test]
+    fn no_streaming_for_segmentable_download() {
+        let probe = ProbeInfo {
+            total: 1024 * 1024,
+            total_known: true,
+            supports_range: true,
+        };
+        assert!(!should_use_streaming(&probe, &cfg_with_compression(true)));
     }
 }

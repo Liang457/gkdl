@@ -1,6 +1,8 @@
 //! 本地测试 HTTP 服务器：支持 Range、可配置失败路径、可忽略 Range。
+//! 另提供 `/gzip`（Content-Encoding: gzip）与 `/nosize`（无 Content-Length）端点用于流式压缩测试。
 #![allow(dead_code)]
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -92,6 +94,16 @@ impl TestServer {
     pub fn broken_url(&self) -> String {
         format!("http://{}/broken", self.addr)
     }
+
+    /// gzip 压缩端点：请求带 `Accept-Encoding: gzip` 时返回 `Content-Encoding: gzip` 的压缩体。
+    pub fn gzip_url(&self) -> String {
+        format!("http://{}/gzip", self.addr)
+    }
+
+    /// 无 Content-Length 端点：body 到连接关闭为止（模拟未知大小）。
+    pub fn nosize_url(&self) -> String {
+        format!("http://{}/nosize", self.addr)
+    }
 }
 
 async fn handle_conn(
@@ -138,7 +150,12 @@ async fn handle_conn(
         return;
     }
 
-    if path != "/file.bin" && path != "/slow" && path != "/hang_download" {
+    if path != "/file.bin"
+        && path != "/slow"
+        && path != "/hang_download"
+        && path != "/gzip"
+        && path != "/nosize"
+    {
         respond(
             &mut socket,
             "404 Not Found",
@@ -183,11 +200,58 @@ async fn handle_conn(
     }
 
     if method == "HEAD" {
+        if path == "/nosize" {
+            // 未知大小：HEAD 也不给 Content-Length
+            let headers = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(headers.as_bytes()).await;
+            return;
+        }
         let headers = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
             data.len()
         );
         let _ = socket.write_all(headers.as_bytes()).await;
+        return;
+    }
+
+    // /gzip：忽略 Range（200 全量），请求带 gzip 编码则回压缩体，否则回原始体
+    if path == "/gzip" {
+        let accept_encoding = {
+            let store = headers.lock().await;
+            store
+                .get("accept-encoding")
+                .cloned()
+                .unwrap_or_default()
+                .join(",")
+        };
+        if accept_encoding.to_ascii_lowercase().contains("gzip") {
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(&data).unwrap();
+            let gz = enc.finish().unwrap();
+            let hdrs = format!(
+                "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                gz.len()
+            );
+            let _ = socket.write_all(hdrs.as_bytes()).await;
+            let _ = socket.write_all(&gz).await;
+        } else {
+            let hdrs = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                data.len()
+            );
+            let _ = socket.write_all(hdrs.as_bytes()).await;
+            let _ = socket.write_all(&data).await;
+        }
+        let _ = socket.flush().await;
+        return;
+    }
+
+    // /nosize：200 全量但无 Content-Length，body 到连接关闭为止
+    if path == "/nosize" {
+        let hdrs = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+        let _ = socket.write_all(hdrs.as_bytes()).await;
+        let _ = socket.write_all(&data).await;
+        let _ = socket.flush().await;
         return;
     }
 

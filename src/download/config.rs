@@ -67,6 +67,12 @@ pub struct DownloadConfig {
     /// 附加请求头（`NAME: value` 列表），随每个请求发送
     #[serde(default)]
     pub header: Vec<String>,
+    /// 是否允许 gzip/deflate 压缩传输。仅对**单连接整文件下载**生效
+    /// （不支持 Range / 无法获取文件大小 / 文件小于最小分片体积×2）；
+    /// 分段下载永远请求 `Accept-Encoding: identity` 拿原始字节。
+    /// 流式（压缩）下载由 libcurl 自动解压，暂停/重试即从头重新下载，无法断点续传。
+    #[serde(default = "default_allow_compression")]
+    pub allow_compression: bool,
 }
 
 fn default_split() -> usize {
@@ -112,6 +118,10 @@ fn default_piece_length() -> u64 {
     1024 * 1024
 }
 
+fn default_allow_compression() -> bool {
+    true
+}
+
 /// 默认 User-Agent：Firefox 浏览器 UA（公开给 engine 作空值兜底）。
 pub fn default_user_agent() -> String {
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:154.0) Gecko/20100101 Firefox/154.0".into()
@@ -140,6 +150,7 @@ impl Default for DownloadConfig {
             user_agent: default_user_agent(),
             referer: String::new(),
             header: Vec::new(),
+            allow_compression: default_allow_compression(),
         }
     }
 }

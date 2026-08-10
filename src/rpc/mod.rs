@@ -44,6 +44,8 @@ pub struct GlobalOptions {
     pub user_agent: String,
     pub referer: String,
     pub header: Vec<String>,
+    /// 是否允许 gzip/deflate 压缩传输（单连接整文件下载）。
+    pub allow_compression: bool,
 }
 
 impl Default for GlobalOptions {
@@ -62,6 +64,7 @@ impl Default for GlobalOptions {
             user_agent: crate::download::config::default_user_agent(),
             referer: String::new(),
             header: Vec::new(),
+            allow_compression: crate::download::config::DownloadConfig::default().allow_compression,
         }
     }
 }

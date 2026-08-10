@@ -1,7 +1,10 @@
 use anyhow::{bail, Context, Result};
+use std::fs::OpenOptions;
 use std::path::Path;
+use std::sync::Mutex;
 
-/// 写盘抽象：`PwriteWriter`（预分配 + 偏移写）与 `MemoryWriter`（小文件内存模式）共用。
+/// 写盘抽象：`PwriteWriter`（预分配 + 偏移写）、`MemoryWriter`（小文件内存模式）、
+/// `StreamingWriter`（未知大小整文件顺序流）共用。
 ///
 /// 并发模型与旧版一致：各 worker 只写自己的非重叠区间，因此 `write_at` 无需同步。
 pub trait DownloadWriter: Send + Sync {
@@ -13,8 +16,12 @@ pub trait DownloadWriter: Send + Sync {
     fn flush_all(&self) -> Result<()>;
     /// 文件总字节数。
     fn total(&self) -> u64;
-    /// 下载完成后收尾：内存模式在此把累积数据原子写入 `out_path`；磁盘模式为 no-op。
+    /// 下载完成后收尾：内存/流式模式在此把累积数据写入 `out_path`；磁盘模式为 no-op。
     fn finalize(&self, out_path: &Path) -> Result<()>;
+    /// 重置（截断为 0），供流式下载重试/恢复时从头开始。默认 no-op。
+    fn reset(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// 小文件内存模式写器：数据累积在 RAM，下载完成后一次性原子落盘。
@@ -108,12 +115,114 @@ impl DownloadWriter for MemoryWriter {
     }
 }
 
+/// 整文件流式写器（未知大小/压缩流）：数据顺序追加到 `.gkdl.tmp`，完成后原子 rename。
+///
+/// 只允许单连接顺序写：`write_at` 忽略偏移、按文件当前长度追加（由单个流式 worker 驱动）。
+/// 总长不可预知（压缩后解压大小、无 Content-Length 等），因此不做预分配、不参与续传。
+pub struct StreamingWriter {
+    file: Mutex<Option<std::fs::File>>,
+    /// 已写字节数（原子计数，`total()` 可在线程外读取）。
+    written: std::sync::atomic::AtomicU64,
+}
+
+impl StreamingWriter {
+    /// 创建/截断临时文件。`out_path` 仅用于推导临时文件名，真正的写入发生在 `finalize`。
+    pub fn new(out_path: &Path) -> Result<Self> {
+        let tmp = out_path.with_extension("gkdl.tmp");
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+            .with_context(|| format!("创建临时文件失败: {}", tmp.display()))?;
+        Ok(Self {
+            file: Mutex::new(Some(file)),
+            written: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+}
+
+impl DownloadWriter for StreamingWriter {
+    fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let mut guard = self
+            .file
+            .lock()
+            .map_err(|_| anyhow::anyhow!("临时文件锁异常"))?;
+        let file = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("临时文件已关闭"))?;
+        // 顺序追加：显式 seek 到 offset（单连接流式写，调用方保证 offset 连续递增）
+        use std::io::{Seek, SeekFrom, Write};
+        file.seek(SeekFrom::Start(offset))?;
+        let mut written = 0usize;
+        while written < data.len() {
+            let n = file.write(&data[written..])?;
+            if n == 0 {
+                bail!("写入停滞: offset={}", offset + written as u64);
+            }
+            written += n;
+        }
+        drop(guard);
+        self.written
+            .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn flush_range(&self, _offset: u64, _len: u64) {}
+
+    fn flush_all(&self) -> Result<()> {
+        let guard = self
+            .file
+            .lock()
+            .map_err(|_| anyhow::anyhow!("临时文件锁异常"))?;
+        if let Some(file) = guard.as_ref() {
+            file.sync_all().with_context(|| "临时文件 sync 失败")?;
+        }
+        Ok(())
+    }
+
+    fn total(&self) -> u64 {
+        self.written.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 收尾：sync、关闭句柄后原子 rename 到 `out_path`（覆盖旧文件）。
+    fn finalize(&self, out_path: &Path) -> Result<()> {
+        self.flush_all()?;
+        // 关闭文件句柄（Windows 下 rename 需要文件未被占用）
+        let mut guard = self
+            .file
+            .lock()
+            .map_err(|_| anyhow::anyhow!("临时文件锁异常"))?;
+        *guard = None;
+        drop(guard);
+        let tmp = out_path.with_extension("gkdl.tmp");
+        std::fs::rename(&tmp, out_path)
+            .with_context(|| format!("临时文件重命名失败: {}", out_path.display()))?;
+        Ok(())
+    }
+
+    /// 重试/恢复：截断临时文件为 0 并从头部重新写。
+    fn reset(&self) -> Result<()> {
+        let guard = self
+            .file
+            .lock()
+            .map_err(|_| anyhow::anyhow!("临时文件锁异常"))?;
+        if let Some(file) = guard.as_ref() {
+            file.set_len(0).with_context(|| "重置临时文件失败")?;
+        }
+        self.written.store(0, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom};
     use std::time::{SystemTime, UNIX_EPOCH};
-
     fn tmp_path(name: &str) -> std::path::PathBuf {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -189,6 +298,37 @@ mod tests {
         let mut b = [0u8; 3];
         f.read_exact(&mut b).unwrap();
         assert_eq!(&b, b"abc");
+        std::fs::remove_file(&out).ok();
+    }
+
+    #[test]
+    fn streaming_writer_appends_and_finalizes() {
+        let out = tmp_path("stream");
+        let w = StreamingWriter::new(&out).unwrap();
+        w.write_at(0, b"hello").unwrap();
+        w.write_at(5, b" world").unwrap();
+        assert_eq!(w.total(), 11);
+        w.flush_all().unwrap();
+        w.finalize(&out).unwrap();
+        let written = std::fs::read(&out).unwrap();
+        assert_eq!(written, b"hello world");
+        // 无残留临时文件
+        assert!(!out.with_extension("gkdl.tmp").exists());
+        std::fs::remove_file(&out).ok();
+    }
+
+    #[test]
+    fn streaming_writer_reset_truncates() {
+        let out = tmp_path("stream_reset");
+        let w = StreamingWriter::new(&out).unwrap();
+        w.write_at(0, b"abcdef").unwrap();
+        assert_eq!(w.total(), 6);
+        w.reset().unwrap();
+        assert_eq!(w.total(), 0);
+        w.write_at(0, b"xy").unwrap();
+        w.finalize(&out).unwrap();
+        let written = std::fs::read(&out).unwrap();
+        assert_eq!(written, b"xy");
         std::fs::remove_file(&out).ok();
     }
 }

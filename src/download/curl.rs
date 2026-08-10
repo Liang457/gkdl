@@ -16,10 +16,11 @@ fn ensure_curl_init() {
     curl::init();
 }
 
-/// 探测结果：总长与 Range 支持情况。
+/// 探测结果：总长（0 表示未知）与 Range 支持情况。
 #[derive(Debug, Clone, Copy)]
 pub struct ProbeInfo {
     pub total: u64,
+    pub total_known: bool,
     pub supports_range: bool,
 }
 
@@ -177,7 +178,13 @@ impl HttpClient {
     }
 
     /// 构造统一配置的 Easy 句柄：URL(normalized)/UA/Referer/自定义头/Range/重定向/连接超时。
-    pub fn easy(&self, url: &str, range: Option<(u64, u64)>) -> Result<Easy> {
+    /// `encoding` 为 `Accept-Encoding` 值；分段/探测传 `"identity"`，流式整文件可传 `"gzip, deflate"`。
+    pub fn easy_with_encoding(
+        &self,
+        url: &str,
+        range: Option<(u64, u64)>,
+        encoding: &str,
+    ) -> Result<Easy> {
         ensure_curl_init();
         let mut easy = Easy::new();
         easy.url(&Self::normalize_url(url))?;
@@ -192,8 +199,7 @@ impl HttpClient {
             }
             easy.http_headers(list)?;
         }
-        // 分段下载必须请求 identity 编码，拿原始字节
-        easy.accept_encoding("identity")?;
+        easy.accept_encoding(encoding)?;
         if let Some((start, end)) = range {
             easy.range(&format!("{start}-{end}"))?;
         }
@@ -201,6 +207,11 @@ impl HttpClient {
         easy.max_redirections(10)?;
         easy.connect_timeout(Duration::from_secs(self.timeout.max(5)))?;
         Ok(easy)
+    }
+
+    /// 分段/探测用的 Easy 句柄：强制 `Accept-Encoding: identity`，拿原始字节。
+    pub fn easy(&self, url: &str, range: Option<(u64, u64)>) -> Result<Easy> {
+        self.easy_with_encoding(url, range, "identity")
     }
 
     /// 阻塞线程中发起流式分段下载：返回消息接收端与后台任务句柄。
@@ -213,8 +224,32 @@ impl HttpClient {
         tokio::sync::mpsc::Receiver<CurlMsg>,
         tokio::task::JoinHandle<()>,
     )> {
+        // 分段下载必须请求 identity 编码，拿原始字节
+        self.stream_impl(url, range, "identity")
+    }
+
+    /// 整文件流式下载（单连接）：无 Range，请求 gzip/deflate 由 libcurl 自动解压。
+    pub fn stream_whole(
+        &self,
+        url: &str,
+    ) -> Result<(
+        tokio::sync::mpsc::Receiver<CurlMsg>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        self.stream_impl(url, None, "gzip, deflate")
+    }
+
+    fn stream_impl(
+        &self,
+        url: &str,
+        range: Option<(u64, u64)>,
+        encoding: &str,
+    ) -> Result<(
+        tokio::sync::mpsc::Receiver<CurlMsg>,
+        tokio::task::JoinHandle<()>,
+    )> {
         ensure_curl_init();
-        let mut easy = self.easy(url, range)?;
+        let mut easy = self.easy_with_encoding(url, range, encoding)?;
         let (tx, rx) = tokio::sync::mpsc::channel::<CurlMsg>(4);
 
         // 头回调：状态行更新 status，空行表示一个响应头块结束 → 发送 Headers。
@@ -346,22 +381,32 @@ impl HttpClient {
             }
             Ok(ProbeInfo {
                 total,
+                total_known: true,
                 supports_range: true,
             })
         } else if status == 200 {
-            // 总长兜底：优先 GET 的 Content-Length，缺失时 HEAD
+            // 总长兜底：优先 GET 的 Content-Length，缺失时 HEAD；都拿不到则视为大小未知
+            // （是否接受未知大小由引擎结合 allow_compression 决定）
             let head_total = self.head_total_blocking(&url, timeout).ok().flatten();
             let total = content_length
                 .and_then(|s| s.parse::<u64>().ok())
-                .or(head_total)
-                .ok_or_else(|| "无法获取文件大小".to_string())?;
-            if total == 0 {
-                return Err("文件大小为 0".to_string());
+                .or(head_total);
+            if let Some(total) = total {
+                if total == 0 {
+                    return Err("文件大小为 0".to_string());
+                }
+                Ok(ProbeInfo {
+                    total,
+                    total_known: true,
+                    supports_range: false,
+                })
+            } else {
+                Ok(ProbeInfo {
+                    total: 0,
+                    total_known: false,
+                    supports_range: false,
+                })
             }
-            Ok(ProbeInfo {
-                total,
-                supports_range: false,
-            })
         } else {
             Err(format!("探测失败: HTTP {status}"))
         }

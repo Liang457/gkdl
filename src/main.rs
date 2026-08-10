@@ -149,6 +149,9 @@ async fn run_download(args: gkdl::app::cli::DownloadArgs) -> i32 {
     if let Some(v) = args.timeout {
         config.timeout = v;
     }
+    if args.no_compression {
+        config.allow_compression = false;
+    }
 
     let hook = HookConfig {
         script: args.post_script.clone(),
@@ -283,6 +286,7 @@ async fn run_daemon(args: DaemonArgs) -> i32 {
         user_agent: download_cfg.user_agent.clone(),
         referer: download_cfg.referer.clone(),
         header: download_cfg.header.clone(),
+        allow_compression: download_cfg.allow_compression,
         dir: if download_cfg.dir.is_empty() {
             std::path::PathBuf::from(".")
         } else {

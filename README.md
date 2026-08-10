@@ -39,7 +39,7 @@ cargo build --release
 ### 直接下载
 
 ```powershell
-gkdl download <url> [-o <path>] [-s 8] [--max-speed <B/s>] [--sha256 <hex>] [--memory-threshold <B>] [--no-memory]
+gkdl download <url> [-o <path>] [-s 8] [--max-speed <B/s>] [--sha256 <hex>] [--memory-threshold <B>] [--no-memory] [--no-compression]
 ```
 
 ### daemon（后台 + RPC + 托盘）
@@ -79,12 +79,23 @@ download:
   memory_threshold: 8388608   # 小文件内存模式阈值，0=禁用，上限 64MB
   rate_limit: 0               # 全局限速 B/s，0=不限
   timeout: 30
+  allow_compression: true     # 单连接整文件下载允许 gzip/deflate 压缩传输
 state:
   retention_days: 7           # 已完成/失败记录保留天数，0=永久
 hook:
   commands_file: "hooks.txt"  # 下载后命令文件，每行一条
   timeout_sec: 60
 ```
+
+### 压缩传输（gzip/deflate）
+
+当下载**无法分段**（服务器不支持 Range、拿不到文件大小、或文件小于 `min_split_size × 2`）时，若 `allow_compression: true`（默认开），引擎会请求 `Accept-Encoding: gzip, deflate` 并依赖 libcurl 自动解压，节省带宽。分段（多线程）下载永远请求 `Accept-Encoding: identity` 拿原始字节，绝不压缩。注意流式（压缩）下载的特性：
+
+- 已知大小的文件按探测到的原始大小显示进度；服务器压缩时解压后内容与探测一致。
+- 服务器不提供大小时 `totalLength` 显示 0（aria2 语义），完成后按实际字节数记录。
+- **无法断点续传**：暂停/失败/重试都从头重新下载；不会残留临时文件（原子 rename 落盘）。
+- 该模式下小文件改走磁盘临时文件（不再走内存模式）。
+- RPC 对应选项为 `http-accept-gzip`（`true`/`false`），与 aria2/AriaNg 兼容。
 
 ## 下载后命令
 
@@ -99,12 +110,12 @@ gkdl/
 │   ├── lib.rs
 │   ├── download/            # 下载引擎
 │   │   ├── curl.rs          # libcurl 传输 + IDN 转码
-│   │   ├── engine.rs        # 探测 / 内存 vs 磁盘模式
-│   │   ├── scheduler.rs     # 工作窃取调度
-│   │   ├── worker.rs        # 单连接下载循环
+│   │   ├── engine.rs        # 探测 / 内存 vs 磁盘 / 流式压缩模式
+│   │   ├── scheduler.rs     # 工作窃取调度（含流式单段）
+│   │   ├── worker.rs        # 单连接下载循环（含流式分支）
 │   │   ├── detector.rs      # 慢线程检测
 │   │   ├── pwrite_writer.rs # 偏移写盘
-│   │   ├── writer.rs        # 内存写入器
+│   │   ├── writer.rs        # 内存 / 流式写入器
 │   │   ├── rate_limit.rs    # 全局限速
 │   │   ├── source.rs        # 多源容错
 │   │   ├── segment.rs       # 段管理

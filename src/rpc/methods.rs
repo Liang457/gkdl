@@ -51,6 +51,7 @@ fn sync_global_to_config(cfg: &mut crate::app::config::Config, g: &GlobalOptions
     cfg.download.user_agent = g.user_agent.clone();
     cfg.download.referer = g.referer.clone();
     cfg.download.header = g.header.clone();
+    cfg.download.allow_compression = g.allow_compression;
 }
 
 /// 解析 aria2 大小写法：裸数字或带 K/M/G 后缀（1024 进制，大小写不敏感）。
@@ -322,6 +323,7 @@ async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> R
                 "user-agent": global.user_agent.clone(),
                 "referer": global.referer.clone(),
                 "header": global.header.clone(),
+                "http-accept-gzip": str_bool(global.allow_compression),
             }))
         }
 
@@ -402,6 +404,11 @@ async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> R
             }
             if let Some(v) = opts.get("header") {
                 global.header = header_list(v);
+            }
+            if let Some(v) = opts.get("http-accept-gzip") {
+                if let Some(b) = v.as_str().and_then(parse_bool) {
+                    global.allow_compression = b;
+                }
             }
             // 其余不支持/未知选项静默忽略（与 aria2 一致）
 
@@ -502,6 +509,7 @@ async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> R
                 user_agent: global.user_agent.clone(),
                 referer: global.referer.clone(),
                 header: global.header.clone(),
+                allow_compression: global.allow_compression,
                 ..Default::default()
             };
             let mut out_path: Option<PathBuf> = None;
@@ -566,6 +574,11 @@ async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> R
                     let list = header_list(h);
                     if !list.is_empty() {
                         config.header = list;
+                    }
+                }
+                if let Some(s) = opts.get("http-accept-gzip").and_then(|v| v.as_str()) {
+                    if let Some(b) = parse_bool(s) {
+                        config.allow_compression = b;
                     }
                 }
             }

@@ -133,6 +133,10 @@ pub struct DownloadArgs {
     #[arg(long)]
     pub timeout: Option<u64>,
 
+    /// 允许 gzip/deflate 压缩传输（仅单连接整文件下载；默认开，--no-compression 关闭）
+    #[arg(long)]
+    pub no_compression: bool,
+
     /// 下载完成后执行的脚本（CLI 直连模式）
     #[arg(long)]
     pub post_script: Option<PathBuf>,

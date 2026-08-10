@@ -23,6 +23,8 @@ pub struct WorkStealingScheduler {
     complete_notify: Notify,
     /// 是否已有段被判定失败且无法重试（引擎据此报错）
     failed: AtomicBool,
+    /// 流式（单连接整文件）模式：禁止工作窃取，段数恒为 1。
+    streaming: bool,
 }
 
 impl WorkStealingScheduler {
@@ -39,6 +41,27 @@ impl WorkStealingScheduler {
             resume_notify: Notify::new(),
             complete_notify: Notify::new(),
             failed: AtomicBool::new(false),
+            streaming: false,
+        }
+    }
+
+    /// 流式（单连接整文件）模式构造：仅一个段覆盖 `0..total`。
+    /// `known_total` 为探测已知大小（解压后大小），未知时用 `u64::MAX` 表示流式结束即完成。
+    pub fn streaming(config: DownloadConfig, known_total: Option<u64>) -> Self {
+        let end = known_total.unwrap_or(u64::MAX);
+        let mut seg = Segment::new(0, 0, end, config.speed_window);
+        seg.state = SegmentState::Pending;
+        let detector = SlowThreadDetector::new(&config);
+        Self {
+            config,
+            segments: Mutex::new(vec![seg]),
+            detector: Mutex::new(detector),
+            seg_counter: std::sync::atomic::AtomicU64::new(1),
+            paused: AtomicBool::new(false),
+            resume_notify: Notify::new(),
+            complete_notify: Notify::new(),
+            failed: AtomicBool::new(false),
+            streaming: true,
         }
     }
 
@@ -68,6 +91,7 @@ impl WorkStealingScheduler {
             resume_notify: Notify::new(),
             complete_notify: Notify::new(),
             failed: AtomicBool::new(false),
+            streaming: false,
         }
     }
 
@@ -190,7 +214,13 @@ impl WorkStealingScheduler {
                 if let Some(seg) = Self::checkout_locked(&mut guard, worker_id) {
                     Some(seg)
                 } else {
-                    Self::steal_locked(&mut guard, worker_id, &self.config, self.alloc_seg_id())
+                    Self::steal_locked(
+                        &mut guard,
+                        worker_id,
+                        &self.config,
+                        self.alloc_seg_id(),
+                        self.streaming,
+                    )
                 }
             };
             if let Some(seg) = seg {
@@ -221,7 +251,12 @@ impl WorkStealingScheduler {
         worker_id: usize,
         config: &DownloadConfig,
         seg_id: u64,
+        streaming: bool,
     ) -> Option<Segment> {
+        // 流式模式只有单段顺序流，禁止窃取，避免破坏写偏移
+        if streaming {
+            return None;
+        }
         let slowest_idx = Self::find_slowest(segs, worker_id, config);
         let slowest_idx = slowest_idx?;
         let slowest = &segs[slowest_idx];
@@ -349,6 +384,15 @@ impl WorkStealingScheduler {
             .all(|s| s.state == SegmentState::Complete)
     }
 
+    /// 流式模式专用：把段的已写进度归零（重试/恢复时从头重新下载）。
+    pub async fn reset_written(&self, seg_id: u64) {
+        let mut guard = self.segments.lock().await;
+        if let Some(t) = guard.iter_mut().find(|s| s.seg_id == seg_id) {
+            t.written = 0;
+            t.clear_speed();
+        }
+    }
+
     /// 记录段失败并递增重试计数。返回应重试还是放弃。
     pub async fn record_failure(&self, seg_id: u64, written: u64) -> FailureAction {
         let mut guard = self.segments.lock().await;
@@ -416,6 +460,26 @@ mod tests {
         assert_eq!(segs.len(), 1);
     }
 
+    #[test]
+    fn streaming_scheduler_has_single_segment_and_no_steal() {
+        let sched = WorkStealingScheduler::streaming(cfg(), Some(10_000));
+        let segs = sched.segments.try_lock().unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].start, 0);
+        assert_eq!(segs[0].end, 10_000);
+        // 未知总长用 u64::MAX
+        drop(segs);
+        let sched2 = WorkStealingScheduler::streaming(cfg(), None);
+        let segs2 = sched2.segments.try_lock().unwrap();
+        assert_eq!(segs2[0].end, u64::MAX);
+        drop(segs2);
+        // 流式模式禁止窃取
+        let mut segs3 = vec![Segment::new(0, 0, 100_000, 20)];
+        segs3[0].owner_id = 0;
+        segs3[0].state = SegmentState::Downloading;
+        assert!(WorkStealingScheduler::steal_locked(&mut segs3, 1, &cfg(), 1, true).is_none());
+    }
+
     #[tokio::test]
     async fn checkout_then_steal() {
         let sched = WorkStealingScheduler::new(1_000_000, cfg());
@@ -445,7 +509,7 @@ mod tests {
         segs[0].owner_id = 0;
         segs[0].state = SegmentState::Downloading;
         segs[0].written = 30_000;
-        let stolen = WorkStealingScheduler::steal_locked(&mut segs, 1, &config, 1).unwrap();
+        let stolen = WorkStealingScheduler::steal_locked(&mut segs, 1, &config, 1, false).unwrap();
         assert!(stolen.start > segs[0].position_to_write());
         assert_eq!(stolen.end, 100_000);
         assert_eq!(segs[0].end, stolen.start);
@@ -462,7 +526,7 @@ mod tests {
         segs[0].owner_id = 0;
         segs[0].state = SegmentState::Downloading;
         segs[0].written = 2000;
-        let stolen = WorkStealingScheduler::steal_locked(&mut segs, 1, &config, 1);
+        let stolen = WorkStealingScheduler::steal_locked(&mut segs, 1, &config, 1, false);
         assert!(stolen.is_none());
     }
 
@@ -485,7 +549,7 @@ mod tests {
             segs[1].record_speed(10.0);
         }
         // worker 2 来窃取，应从最慢的 seg1 切
-        let stolen = WorkStealingScheduler::steal_locked(&mut segs, 2, &config, 10).unwrap();
+        let stolen = WorkStealingScheduler::steal_locked(&mut segs, 2, &config, 10, false).unwrap();
         // 窃取的段来自 seg1 的尾部
         assert_eq!(stolen.end, 400_000);
         assert!(stolen.start > 200_000, "窃取起点应在 seg1 范围内");
@@ -501,7 +565,7 @@ mod tests {
         segs[0].state = SegmentState::Downloading;
         segs[0].written = 0;
         // remaining = 100_000, cut = 40_000, cut_point = 60_000
-        let stolen = WorkStealingScheduler::steal_locked(&mut segs, 1, &config, 1).unwrap();
+        let stolen = WorkStealingScheduler::steal_locked(&mut segs, 1, &config, 1, false).unwrap();
         assert_eq!(stolen.start, 60_000);
         assert_eq!(stolen.end, 100_000);
         assert_eq!(segs[0].end, 60_000);
@@ -520,7 +584,7 @@ mod tests {
             segs[0].record_speed(10.0);
         }
         // worker 0 不能从自己的段窃取
-        let stolen = WorkStealingScheduler::steal_locked(&mut segs, 0, &config, 1);
+        let stolen = WorkStealingScheduler::steal_locked(&mut segs, 0, &config, 1, false);
         assert!(stolen.is_none());
     }
 
@@ -537,7 +601,7 @@ mod tests {
         segs[1].owner_id = 1;
         segs[1].state = SegmentState::Complete;
         // 没有 Downloading 段可窃取
-        let stolen = WorkStealingScheduler::steal_locked(&mut segs, 2, &config, 10);
+        let stolen = WorkStealingScheduler::steal_locked(&mut segs, 2, &config, 10, false);
         assert!(stolen.is_none());
     }
 

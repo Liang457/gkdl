@@ -37,6 +37,8 @@ pub struct DownloadWorker {
     limiter: TokenBucket,
     config: DownloadConfig,
     supports_range: bool,
+    /// 流式（单连接整文件）模式：无 Range、可 gzip/deflate、流结束即完成、重试从头开始。
+    streaming: bool,
     cancel_token: tokio_util::sync::CancellationToken,
 }
 
@@ -95,6 +97,7 @@ impl DownloadWorker {
         limiter: TokenBucket,
         config: DownloadConfig,
         supports_range: bool,
+        streaming: bool,
         cancel_token: tokio_util::sync::CancellationToken,
     ) -> Self {
         Self {
@@ -106,6 +109,7 @@ impl DownloadWorker {
             limiter,
             config,
             supports_range,
+            streaming,
             cancel_token,
         }
     }
@@ -172,17 +176,39 @@ impl DownloadWorker {
 
         let start = seg.position_to_write();
         let end = seg.end; // exclusive
-        let range = if self.supports_range {
-            Some((start, end.saturating_sub(1)))
-        } else {
-            None
-        };
-        let (mut rx, _handle) = match self.client.stream_segment(&source.url, range) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!("worker {} 创建下载流失败: {}", self.worker_id, e);
+        let (mut rx, _handle) = if self.streaming {
+            // 流式整文件：无 Range，允许 gzip/deflate（libcurl 自动解压）；
+            // 重试/恢复无法断点，截断文件并从头部重新下载。
+            if let Err(e) = self.writer.reset() {
+                tracing::warn!("worker {} 重置临时文件失败: {}", self.worker_id, e);
                 self.source_mgr.report_failure(&source);
                 return SegOutcome::Failed;
+            }
+            seg.written = 0;
+            seg.tick_bytes = 0;
+            seg.clear_speed();
+            self.scheduler.reset_written(seg.seg_id).await;
+            match self.client.stream_whole(&source.url) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!("worker {} 创建流式下载失败: {}", self.worker_id, e);
+                    self.source_mgr.report_failure(&source);
+                    return SegOutcome::Failed;
+                }
+            }
+        } else {
+            let range = if self.supports_range {
+                Some((start, end.saturating_sub(1)))
+            } else {
+                None
+            };
+            match self.client.stream_segment(&source.url, range) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!("worker {} 创建下载流失败: {}", self.worker_id, e);
+                    self.source_mgr.report_failure(&source);
+                    return SegOutcome::Failed;
+                }
             }
         };
 
@@ -231,7 +257,13 @@ impl DownloadWorker {
             }
         }
 
-        if !(status == 200 || status == 206) {
+        // 分段：200 或 206 均接受；流式：未发 Range，必须 200（206 视为异常）
+        let ok_status = if self.streaming {
+            status == 200
+        } else {
+            status == 200 || status == 206
+        };
+        if !ok_status {
             self.source_mgr.report_failure(&source);
             return SegOutcome::Failed;
         }
@@ -405,7 +437,15 @@ impl DownloadWorker {
 
         self.source_mgr.report_success(source);
 
-        if seg.is_complete() {
+        if self.streaming {
+            // 流式：未知大小 → 流结束即完成；已知大小 → 必须写满段长，
+            // 否则视为截断（服务器提前结束但连接干净关闭，Content-Length 无法兜底）。
+            if seg.end == u64::MAX || seg.is_complete() {
+                SegOutcome::Complete
+            } else {
+                SegOutcome::Failed
+            }
+        } else if seg.is_complete() {
             SegOutcome::Complete
         } else {
             // 响应提前结束，段未满

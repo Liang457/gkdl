@@ -264,7 +264,8 @@ async fn small_file_memory_mode_no_file_until_done() {
 
     let config = DownloadConfig {
         split: 4,
-        rate_limit: 256 * 1024, // 256 KB/s → 256 KiB 约 1s，留足观察窗口
+        rate_limit: 256 * 1024,   // 256 KB/s → 256 KiB 约 1s，留足观察窗口
+        allow_compression: false, // 关闭压缩，保证走内存模式
         ..Default::default()
     };
     let handle = engine::start_download(
@@ -317,7 +318,8 @@ async fn memory_mode_disabled_uses_disk() {
     let config = DownloadConfig {
         split: 4,
         rate_limit: 2 * 1024 * 1024,
-        memory_threshold: 0, // 禁用内存模式
+        memory_threshold: 0,      // 禁用内存模式
+        allow_compression: false, // 关闭压缩，保证走磁盘预分配
         ..Default::default()
     };
     let handle = engine::start_download(
@@ -404,5 +406,107 @@ async fn slow_server_with_multi_source_failover() {
 
     let written = std::fs::read(&out).unwrap();
     assert_eq!(written, data, "多源慢服务器下载内容不一致");
+    std::fs::remove_file(&out).ok();
+}
+
+/// gzip 压缩下载：服务器回 `Content-Encoding: gzip`，引擎应请求压缩并自动解压得到原始内容。
+#[tokio::test]
+async fn gzip_streaming_download_decompresses() {
+    let data = make_data(512 * 1024);
+    let server = TestServer::start(data.clone(), false).await;
+    let out = out_path("gzip_it");
+    let _ = std::fs::remove_file(&out);
+
+    let config = DownloadConfig {
+        allow_compression: true,
+        ..Default::default()
+    };
+    let report = engine::download(
+        vec![server.gzip_url()],
+        Some(out.clone()),
+        config,
+        None,
+        None,
+        |_| {},
+    )
+    .await
+    .expect("gzip 下载失败");
+    // 探测拿到的是原始大小（identity），流式解压后应为相同字节数
+    assert_eq!(report.total as usize, data.len());
+
+    let written = std::fs::read(&out).unwrap();
+    assert_eq!(written, data, "gzip 解压后内容不一致");
+    // 服务器应收到过带 gzip 的 Accept-Encoding
+    let enc = server.request_headers("accept-encoding").await;
+    assert!(
+        enc.iter().any(|v| v.to_ascii_lowercase().contains("gzip")),
+        "应请求 gzip 编码，实际: {enc:?}"
+    );
+    assert!(!out.with_extension("gkdl.tmp").exists(), "不应残留临时文件");
+    std::fs::remove_file(&out).ok();
+}
+
+/// 未知大小下载：服务器不提供 Content-Length，引擎应走流式整文件下载并成功。
+#[tokio::test]
+async fn unknown_size_streaming_download() {
+    let data = make_data(300 * 1024);
+    let server = TestServer::start(data.clone(), false).await;
+    let out = out_path("nosize_it");
+    let _ = std::fs::remove_file(&out);
+
+    let config = DownloadConfig {
+        allow_compression: true,
+        ..Default::default()
+    };
+    let report = engine::download(
+        vec![server.nosize_url()],
+        Some(out.clone()),
+        config,
+        None,
+        None,
+        |_| {},
+    )
+    .await
+    .expect("未知大小下载失败");
+    // 报告总长为实际写出的字节数
+    assert_eq!(report.total as usize, data.len());
+
+    let written = std::fs::read(&out).unwrap();
+    assert_eq!(written, data, "未知大小下载内容不一致");
+    std::fs::remove_file(&out).ok();
+}
+
+/// 关闭压缩：即使服务器支持 gzip，也不应发送 Accept-Encoding: gzip。
+#[tokio::test]
+async fn compression_disabled_sends_identity() {
+    let data = make_data(128 * 1024);
+    let server = TestServer::start(data.clone(), false).await;
+    let out = out_path("nocompress_it");
+    let _ = std::fs::remove_file(&out);
+
+    let config = DownloadConfig {
+        allow_compression: false,
+        ..Default::default()
+    };
+    let report = engine::download(
+        vec![server.gzip_url()],
+        Some(out.clone()),
+        config,
+        None,
+        None,
+        |_| {},
+    )
+    .await
+    .expect("关闭压缩下载失败");
+    assert_eq!(report.total as usize, data.len());
+
+    let written = std::fs::read(&out).unwrap();
+    assert_eq!(written, data, "关闭压缩内容不一致");
+    // 服务器应未收到 gzip 编码请求
+    let enc = server.request_headers("accept-encoding").await;
+    assert!(
+        !enc.iter().any(|v| v.to_ascii_lowercase().contains("gzip")),
+        "关闭压缩后不应请求 gzip，实际: {enc:?}"
+    );
     std::fs::remove_file(&out).ok();
 }

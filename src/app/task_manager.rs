@@ -503,6 +503,7 @@ impl TaskManager {
 
             match handle.join().await {
                 Ok(report) => {
+                    task_for_driver.total.store(report.total, Ordering::Relaxed);
                     task_for_driver
                         .completed
                         .store(report.total, Ordering::Relaxed);
@@ -771,6 +772,8 @@ impl TaskManager {
         let legacy = PathBuf::from(format!("{}.gkdl", task.out_path.display()));
         std::fs::remove_file(&legacy).ok();
         std::fs::remove_file(legacy.with_extension("gkdl.tmp")).ok();
+        // 清理流式/内存模式残留的临时文件（`{stem}.gkdl.tmp`，与旧版命名不同）
+        std::fs::remove_file(task.out_path.with_extension("gkdl.tmp")).ok();
         // 仅在确认该路径仍归属本任务（或已无占用且无完整结果）时删除输出文件，
         // 防止旧任务迟到的清理误删新任务已下载完成的文件。
         if self.can_delete_path(&task.out_path, &task.gid) {
