@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::broadcast;
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,25 +93,33 @@ pub enum TaskEvent {
 pub struct ConcurrencyGate {
     max: AtomicU64,
     active: AtomicU64,
-    notify: Notify,
+    /// 状态变更信号（watch 版本号）：`set_max` 与槽位释放必然 +1。
+    /// `acquire` 依赖版本判定可靠唤醒，规避 `Notify::notify_waiters`
+    /// 在「检查后、注册前」发出导致排队任务永久挂起的竞态。
+    notify_tx: watch::Sender<()>,
+    notify_rx: watch::Receiver<()>,
 }
 
 impl ConcurrencyGate {
     pub fn new() -> Self {
+        let (notify_tx, notify_rx) = watch::channel(());
         Self {
             max: AtomicU64::new(0),
             active: AtomicU64::new(0),
-            notify: Notify::new(),
+            notify_tx,
+            notify_rx,
         }
     }
 
     pub fn set_max(&self, n: u64) {
         self.max.store(n, Ordering::Relaxed);
-        self.notify.notify_waiters();
+        let _ = self.notify_tx.send(());
     }
 
     /// 尝试获取槽位；排队期间被取消则返回 None。
     pub async fn acquire(&self, cancelled: &CancellationToken) -> Option<ConcurrencyPermit<'_>> {
+        // 接收端在等待前克隆并保持旧版本号：任何已发生的变更都会让 changed() 立即返回
+        let mut rx = self.notify_rx.clone();
         loop {
             if cancelled.is_cancelled() {
                 return None;
@@ -139,7 +147,11 @@ impl ConcurrencyGate {
                 continue;
             }
             tokio::select! {
-                _ = self.notify.notified() => {}
+                r = rx.changed() => {
+                    if r.is_err() {
+                        return None; // 发送端已释放（门控销毁）
+                    }
+                }
                 _ = cancelled.cancelled() => return None,
             }
         }
@@ -164,7 +176,8 @@ impl Drop for ConcurrencyPermit<'_> {
         if self.counted {
             self.gate.active.fetch_sub(1, Ordering::SeqCst);
         }
-        self.gate.notify.notify_waiters();
+        // 先释放槽位再发信号，等待者醒来后能看到可用的槽位
+        let _ = self.gate.notify_tx.send(());
     }
 }
 

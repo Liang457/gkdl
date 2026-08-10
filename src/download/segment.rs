@@ -44,20 +44,21 @@ impl Segment {
     }
 
     pub fn remaining(&self) -> u64 {
-        self.end.saturating_sub(self.start + self.written)
+        self.end
+            .saturating_sub(self.start.saturating_add(self.written))
     }
 
     pub fn position_to_write(&self) -> u64 {
-        self.start + self.written
+        self.start.saturating_add(self.written)
     }
 
     pub fn is_complete(&self) -> bool {
-        self.written >= (self.end - self.start)
+        self.written >= self.end.saturating_sub(self.start)
     }
 
     #[allow(dead_code)]
     pub fn len(&self) -> u64 {
-        self.end - self.start
+        self.end.saturating_sub(self.start)
     }
 
     #[allow(dead_code)]

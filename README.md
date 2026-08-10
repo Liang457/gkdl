@@ -73,7 +73,7 @@ daemon:
   host: 127.0.0.1
   port: 6800
   rpc_secret: ""
-  aria2ng_url: ""        # 托盘「打开 aria2ng」地址，留空不显示
+  aria_ng_url: ""        # 托盘「打开 AriaNG」地址，留空不显示
 download:
   split: 8
   memory_threshold: 8388608   # 小文件内存模式阈值，0=禁用，上限 64MB

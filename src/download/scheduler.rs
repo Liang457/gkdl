@@ -3,7 +3,7 @@ use crate::download::config::DownloadConfig;
 use crate::download::detector::{SlowThreadDetector, Verdict};
 use crate::download::segment::{Segment, SegmentState};
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{watch, Mutex, Notify};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureAction {
@@ -19,7 +19,11 @@ pub struct WorkStealingScheduler {
     detector: Mutex<SlowThreadDetector>,
     seg_counter: std::sync::atomic::AtomicU64,
     paused: AtomicBool,
-    resume_notify: Notify,
+    /// 暂停状态变更信号（watch 版本号）：任何 `set_paused` 都会 +1，
+    /// `wait_resume` 据此可靠唤醒，规避 `Notify::notify_waiters` 在
+    /// 「检查标志后、注册等待前」发出导致唤醒丢失、worker 永久挂起的竞态。
+    resume_tx: watch::Sender<()>,
+    resume_rx: watch::Receiver<()>,
     complete_notify: Notify,
     /// 是否已有段被判定失败且无法重试（引擎据此报错）
     failed: AtomicBool,
@@ -32,13 +36,15 @@ impl WorkStealingScheduler {
         let detector = SlowThreadDetector::new(&config);
         let segments = Self::initial_split(total_size, &config);
         let seg_count = segments.len() as u64;
+        let (resume_tx, resume_rx) = watch::channel(());
         Self {
             config,
             segments: Mutex::new(segments),
             detector: Mutex::new(detector),
             seg_counter: std::sync::atomic::AtomicU64::new(seg_count),
             paused: AtomicBool::new(false),
-            resume_notify: Notify::new(),
+            resume_tx,
+            resume_rx,
             complete_notify: Notify::new(),
             failed: AtomicBool::new(false),
             streaming: false,
@@ -52,13 +58,15 @@ impl WorkStealingScheduler {
         let mut seg = Segment::new(0, 0, end, config.speed_window);
         seg.state = SegmentState::Pending;
         let detector = SlowThreadDetector::new(&config);
+        let (resume_tx, resume_rx) = watch::channel(());
         Self {
             config,
             segments: Mutex::new(vec![seg]),
             detector: Mutex::new(detector),
             seg_counter: std::sync::atomic::AtomicU64::new(1),
             paused: AtomicBool::new(false),
-            resume_notify: Notify::new(),
+            resume_tx,
+            resume_rx,
             complete_notify: Notify::new(),
             failed: AtomicBool::new(false),
             streaming: true,
@@ -69,6 +77,7 @@ impl WorkStealingScheduler {
     pub fn from_resume(segments: Vec<Segment>, config: DownloadConfig) -> Self {
         let detector = SlowThreadDetector::new(&config);
         let seg_count = segments.len() as u64;
+        let (resume_tx, resume_rx) = watch::channel(());
         let mut normalized = Vec::with_capacity(segments.len());
         for (counter, mut s) in segments.into_iter().enumerate() {
             s.owner_id = usize::MAX;
@@ -88,7 +97,8 @@ impl WorkStealingScheduler {
             detector: Mutex::new(detector),
             seg_counter: std::sync::atomic::AtomicU64::new(seg_count),
             paused: AtomicBool::new(false),
-            resume_notify: Notify::new(),
+            resume_tx,
+            resume_rx,
             complete_notify: Notify::new(),
             failed: AtomicBool::new(false),
             streaming: false,
@@ -131,9 +141,9 @@ impl WorkStealingScheduler {
     #[allow(dead_code)]
     pub fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::Relaxed);
-        if !paused {
-            self.resume_notify.notify_waiters();
-        }
+        // 先写标志再发送版本号：任何 set_paused（暂停/恢复）都会唤醒等待者，
+        // 由它们自行重查标志，配合 watch 的版本判定保证不丢唤醒。
+        let _ = self.resume_tx.send(());
     }
 
     #[allow(dead_code)]
@@ -141,13 +151,21 @@ impl WorkStealingScheduler {
         self.paused.load(Ordering::Relaxed)
     }
 
-    /// 等待解除暂停。暂停中则挂起，直到 resume_notify 被通知。
+    /// 等待解除暂停。暂停中则挂起，直到再次 `set_paused`（版本号 +1）。
+    ///
+    /// 用 `watch` 而非 `Notify`：`notify_waiters` 在「检查标志后、注册等待前」
+    /// 发出的唤醒会被永久丢失（worker 卡死）。watch 的版本号在等待前即完成
+    /// 比较，任何已发生的变更都会让 `changed()` 立即返回。
     pub async fn wait_resume(&self) {
+        // 只克隆一次接收端：每轮循环内保持旧版本号，变更判定才可靠。
+        let mut rx = self.resume_rx.clone();
         loop {
             if !self.paused.load(Ordering::Relaxed) {
                 return;
             }
-            self.resume_notify.notified().await;
+            if rx.changed().await.is_err() {
+                return; // 发送端已释放（调度器销毁），视为已解除暂停
+            }
         }
     }
 
@@ -204,31 +222,28 @@ impl WorkStealingScheduler {
 
     /// 工作窃取主入口：先拿无主段，否则从最慢段尾部切 40%。
     pub async fn steal_or_checkout(&self, worker_id: usize) -> Option<Segment> {
-        loop {
-            if self.paused.load(Ordering::Relaxed) {
-                self.resume_notify.notified().await;
-                continue;
+        // 暂停时可靠等待恢复（watch 版本号，不丢唤醒）；恢复后只取一次，
+        // 拿不到段/无法窃取即返回 None（worker 退出），与原始语义一致。
+        self.wait_resume().await;
+        let seg = {
+            let mut guard = self.segments.lock().await;
+            if let Some(seg) = Self::checkout_locked(&mut guard, worker_id) {
+                Some(seg)
+            } else {
+                Self::steal_locked(
+                    &mut guard,
+                    worker_id,
+                    &self.config,
+                    self.alloc_seg_id(),
+                    self.streaming,
+                )
             }
-            let seg = {
-                let mut guard = self.segments.lock().await;
-                if let Some(seg) = Self::checkout_locked(&mut guard, worker_id) {
-                    Some(seg)
-                } else {
-                    Self::steal_locked(
-                        &mut guard,
-                        worker_id,
-                        &self.config,
-                        self.alloc_seg_id(),
-                        self.streaming,
-                    )
-                }
-            };
-            if let Some(seg) = seg {
-                self.register_worker(worker_id).await;
-                return Some(seg);
-            }
-            return None;
+        };
+        if let Some(seg) = seg {
+            self.register_worker(worker_id).await;
+            return Some(seg);
         }
+        None
     }
 
     fn alloc_seg_id(&self) -> u64 {
@@ -356,11 +371,18 @@ impl WorkStealingScheduler {
         let target = guard.iter_mut().find(|s| s.seg_id == seg.seg_id);
         if let Some(t) = target {
             if t.state == SegmentState::Downloading {
-                t.state = SegmentState::Pending;
-                t.owner_id = usize::MAX;
                 let max_written = t.end.saturating_sub(t.start);
                 t.written = seg.written.max(t.written).min(max_written);
                 t.clear_speed();
+                t.owner_id = usize::MAX;
+                // 工作窃取截短段尾后，worker 本地 written 可能已写满新的分配区间
+                // （字节已在盘上）。此时若仍置 Pending，会出现「剩余 0 字节的
+                // Pending 段」永远不会被 checkout，导致整个下载被误判失败。
+                if t.written >= max_written {
+                    t.state = SegmentState::Complete;
+                } else {
+                    t.state = SegmentState::Pending;
+                }
             }
         }
     }

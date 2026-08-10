@@ -271,7 +271,7 @@ async fn list_tasks_status(tasks: impl Iterator<Item = Arc<Task>>) -> Value {
     Value::Array(arr)
 }
 
-/// aria2.getVersion 对外声明的启用特性（统一开关）。
+/// aria2.getVersion 对外声明的静态启用特性（统一开关）。
 ///
 /// 已实现并声明：
 /// - `Threaded DNS`：curl 线程化异步 DNS
@@ -287,6 +287,9 @@ async fn list_tasks_status(tasks: impl Iterator<Item = Arc<Task>>) -> Value {
 /// - `BitTorrent`（含 magnet、tracker、DHT 等）
 /// - `Metalink`
 /// - `Firefox3 Cookie`
+///
+/// 运行时还会在此列表之后追加 libcurl/TLS/zlib/nghttp2 的库版本条目（见
+/// [`enabled_features`]），AriaNg 会把数组逐项原样渲染到"已启用功能"。
 pub const ENABLED_FEATURES: &[&str] = &[
     "Threaded DNS",
     "HTTPS",
@@ -295,11 +298,34 @@ pub const ENABLED_FEATURES: &[&str] = &[
     "XML-RPC",
 ];
 
+/// nghttp2 版本号编码为 `major<<16 | minor<<8 | patch`，拆成 `x.y.z` 可读形式。
+fn fmt_version_num(n: u32) -> String {
+    format!("{}.{}.{}", n >> 16, (n >> 8) & 0xff, n & 0xff)
+}
+
+/// 组装 getVersion 对外声明的特性列表：静态 [`ENABLED_FEATURES`] + 运行时库版本信息。
+fn enabled_features() -> Vec<String> {
+    curl::init();
+    let mut v: Vec<String> = ENABLED_FEATURES.iter().map(|s| (*s).to_string()).collect();
+    let vinfo = curl::Version::get();
+    v.push(format!("libcurl {}", curl::Version::num()));
+    if let Some(s) = vinfo.ssl_version() {
+        v.push(format!("TLS: {s}"));
+    }
+    if let Some(z) = vinfo.libz_version() {
+        v.push(format!("zlib {z}"));
+    }
+    if let Some(n) = vinfo.nghttp2_version_num() {
+        v.push(format!("nghttp2 {}", fmt_version_num(n)));
+    }
+    v
+}
+
 async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> RpcResult {
     match method {
         "aria2.getVersion" => Ok(json!({
             "version": env!("CARGO_PKG_VERSION"),
-            "enabledFeatures": ENABLED_FEATURES,
+            "enabledFeatures": enabled_features(),
         })),
 
         "aria2.getSessionInfo" => Ok(json!({
@@ -412,7 +438,7 @@ async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> R
             }
             // 其余不支持/未知选项静默忽略（与 aria2 一致）
 
-            // 同步回配置文件：aria2ng 提交的设置修改要落实到 config.yaml
+            // 同步回配置文件：AriaNG 提交的设置修改要落实到 config.yaml
             if let Some(store) = ctx.config {
                 {
                     let mut cfg = store.inner.lock().await;
@@ -923,6 +949,20 @@ mod tests {
         }
         assert!(ENABLED_FEATURES.contains(&"HTTPS"));
         assert!(ENABLED_FEATURES.contains(&"Message Digest"));
+    }
+
+    #[test]
+    fn enabled_features_include_runtime_versions() {
+        let f = enabled_features();
+        assert!(f.iter().any(|s| s.starts_with("libcurl ")));
+        assert!(f.iter().any(|s| s.starts_with("nghttp2 ")));
+        assert!(!f
+            .iter()
+            .any(|s| matches!(s.as_str(), "BitTorrent" | "Metalink")));
+        // 版本号只放纯数字，不带多余前缀
+        assert!(f
+            .iter()
+            .any(|s| s == &format!("libcurl {}", curl::Version::num())));
     }
 
     #[tokio::test]

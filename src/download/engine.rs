@@ -128,7 +128,7 @@ pub fn should_use_streaming(probe: &ProbeInfo, config: &DownloadConfig) -> bool 
         || probe.total < config.min_split_size.max(1).saturating_mul(2)
 }
 
-/// 从 URL 提取文件名（百分号解码）。
+/// 从 URL 提取文件名（百分号解码 + 路径分隔符清洗）。
 pub fn filename_from_url(url: &str) -> String {
     let path = url.split(['?', '#']).next().unwrap_or(url);
     if path.ends_with('/') {
@@ -138,7 +138,23 @@ pub fn filename_from_url(url: &str) -> String {
     if name.is_empty() {
         return "download.bin".to_string();
     }
-    percent_decode(&name)
+    sanitize_filename(&percent_decode(&name))
+}
+
+/// 清洗从 URL 推导的文件名。百分号解码可能重新引入路径分隔符（`%2F`、`%5C`），
+/// 或直接得到 `..`；这类名字用作输出路径会逃逸到目标目录之外，统一替换/兜底。
+fn sanitize_filename(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        match c {
+            '/' | '\\' => out.push('_'),
+            _ => out.push(c),
+        }
+    }
+    if out == "." || out == ".." {
+        return "download.bin".into();
+    }
+    out
 }
 
 fn percent_decode(s: &str) -> String {
@@ -497,10 +513,17 @@ pub async fn start_download(
                 handles.push(tokio::spawn(async move { worker.run().await }));
             }
 
-            for h in handles {
-                h.await.context("worker 协程异常退出")?;
-            }
+            // 汇总 worker 结果；无论成败都先中止 monitor，防止 worker 协程异常时
+            // 监控协程继续泄漏运行（持有一组 Arc 引用与进度回调，永不结束）。
+            let workers_result: Result<()> = (async {
+                for h in handles {
+                    h.await.context("worker 协程异常退出")?;
+                }
+                Ok(())
+            })
+            .await;
             monitor.abort();
+            workers_result?;
 
             if !sched_task.all_done().await {
                 let failed = sched_task
@@ -621,6 +644,19 @@ mod tests {
         assert_eq!(filename_from_url("https://a.com/b/c.zip?x=1"), "c.zip");
         assert_eq!(filename_from_url("https://a.com/b/"), "download.bin");
         assert_eq!(filename_from_url("https://a.com/%E6%B5%8B.txt"), "测.txt");
+    }
+
+    #[test]
+    fn filename_sanitizes_path_traversal() {
+        // 百分号解码重新引入路径分隔符 / 反斜杠 → 替换为下划线
+        assert_eq!(
+            filename_from_url("https://a.com/%2E%2E%2Fevil.txt"),
+            ".._evil.txt"
+        );
+        assert_eq!(filename_from_url("https://a.com/a%5Cb.txt"), "a_b.txt");
+        // 解码结果为 `.` / `..` → 兜底为 download.bin
+        assert_eq!(filename_from_url("https://a.com/%2E%2E"), "download.bin");
+        assert_eq!(filename_from_url("https://a.com/%2E"), "download.bin");
     }
 
     fn cfg_with_compression(on: bool) -> DownloadConfig {

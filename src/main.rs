@@ -216,6 +216,8 @@ async fn run_download(args: gkdl::app::cli::DownloadArgs) -> i32 {
         }
         Err(e) => {
             eprintln!("下载失败: {e:#}");
+            // 清理流式/内存模式的临时文件残留（磁盘模式的部分文件保留以便续传）
+            let _ = std::fs::remove_file(task.out_path.with_extension("gkdl.tmp"));
             1
         }
     }
@@ -401,12 +403,12 @@ async fn run_daemon(args: DaemonArgs) -> i32 {
     let (tray_tx, mut tray_rx) = tokio::sync::mpsc::unbounded_channel::<tray::TrayCommand>();
     if !daemon_cfg.no_tray {
         let log_dir = resolve_log_dir(&config_dir, &file_cfg.log);
-        let aria2ng_url = if daemon_cfg.aria2ng_url.is_empty() {
+        let aria_ng_url = if daemon_cfg.aria_ng_url.is_empty() {
             None
         } else {
-            Some(daemon_cfg.aria2ng_url.clone())
+            Some(daemon_cfg.aria_ng_url.clone())
         };
-        tray::spawn_tray(tray_tx, config_dir.clone(), log_dir, aria2ng_url);
+        tray::spawn_tray(tray_tx, config_dir.clone(), log_dir, aria_ng_url);
     }
 
     // 主循环：等待 shutdown / 托盘命令

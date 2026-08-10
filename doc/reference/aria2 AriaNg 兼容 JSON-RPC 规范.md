@@ -448,6 +448,10 @@ files, bittorrent, infoHash
 
 > ⚠️ 实际字符串是 **`"Firefox3 Cookie"`**（带数字 3；`FeatureConfig.cc:136`），不是 `"Firefox Cookies"`。AriaNg 的常量与 `aria2c.rst` 都用前者。
 
+> ℹ️ **GKDL 扩展**：`enabledFeatures` 中除 aria2 特性名外，还会在末尾附加运行时库版本条目
+> （`libcurl <版本>`、`TLS: <后端>`、`zlib <版本>`、`nghttp2 <版本>`），AriaNg 会把它们
+> 原样渲染到"已启用功能"区域。
+
 `enabledFeatures` 列表（来自 `FeatureConfig.cc:115-189`）：
 
 | 字符串 | 编译宏 |

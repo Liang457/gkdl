@@ -12,8 +12,9 @@ pub struct DaemonConfig {
     pub port: u16,
     pub rpc_secret: String,
     pub no_tray: bool,
-    /// 托盘「打开 aria2ng」指向的 Web UI 地址，留空则不显示该菜单项
-    pub aria2ng_url: String,
+    /// 托盘「打开 AriaNG」指向的 Web UI 地址，留空则不显示该菜单项
+    #[serde(alias = "aria2ng_url")]
+    pub aria_ng_url: String,
 }
 
 impl Default for DaemonConfig {
@@ -23,7 +24,7 @@ impl Default for DaemonConfig {
             port: 6800,
             rpc_secret: String::new(),
             no_tray: false,
-            aria2ng_url: String::new(),
+            aria_ng_url: String::new(),
         }
     }
 }

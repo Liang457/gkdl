@@ -203,7 +203,7 @@ async fn call(base: &str, method: &str, params: serde_json::Value) -> serde_json
 
 #[tokio::test]
 async fn change_global_option_persists_to_config_file() {
-    // aria2ng 通过 changeGlobalOption 修改设置后，应同步写回 config.yaml
+    // AriaNG 通过 changeGlobalOption 修改设置后，应同步写回 config.yaml
     let cfg_path = std::env::temp_dir()
         .join("gkdl_it")
         .join(format!("cfg_persist_{}.yaml", std::process::id()));
@@ -350,6 +350,8 @@ async fn rpc_server_serves_aria2_methods() {
     assert!(features.contains(&"Message Digest"));
     assert!(!features.contains(&"BitTorrent"));
     assert!(!features.contains(&"Metalink"));
+    // 附加运行时库版本信息（libcurl/TLS/zlib/nghttp2）
+    assert!(features.iter().any(|f| f.contains("libcurl")));
 
     // 鉴权失败：错误 token → 400 且延迟
     let t0 = std::time::Instant::now();

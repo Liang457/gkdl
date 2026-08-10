@@ -214,6 +214,14 @@ impl DownloadWorker {
 
         // 读超时语义：两次 chunk 间隔超时（每次读后重置），更贴合低网速
         let timeout = std::time::Duration::from_secs(self.config.timeout.max(5));
+        // 提前退出路径统一先刷盘，防止「已计入 written 但仍在写缓冲」的字节丢失：
+        // 否则调度器/状态库记录的进度会跳过这些字节，续传生成损坏文件。
+        let flush_early = |buf: &mut WriteBuffer| {
+            if let Err(e) = buf.flush() {
+                tracing::warn!("worker {} 提前退出刷盘失败: {}", self.worker_id, e);
+            }
+            SegOutcome::Failed
+        };
         let mut status = 0u32;
         let mut first_chunk: Option<Vec<u8>> = None;
 
@@ -300,6 +308,7 @@ impl DownloadWorker {
                 Ok(v) => v,
                 Err(_) => {
                     tracing::debug!("worker {} 读流超时", self.worker_id);
+                    flush_early(&mut buf);
                     self.source_mgr.report_failure(&source);
                     return SegOutcome::Failed;
                 }
@@ -310,6 +319,11 @@ impl DownloadWorker {
                 Some(CurlMsg::End(Ok(()))) => break,
                 Some(CurlMsg::End(Err(e))) => {
                     if self.cancel_token.is_cancelled() {
+                        if let Err(e) = buf.flush() {
+                            tracing::warn!("worker {} 取消刷盘失败: {}", self.worker_id, e);
+                            self.source_mgr.report_failure(&source);
+                            return SegOutcome::Failed;
+                        }
                         return SegOutcome::Cancelled;
                     }
                     tracing::debug!(
@@ -317,10 +331,12 @@ impl DownloadWorker {
                         self.worker_id,
                         curl_error_text(&e)
                     );
+                    flush_early(&mut buf);
                     self.source_mgr.report_failure(&source);
                     return SegOutcome::Failed;
                 }
                 None => {
+                    flush_early(&mut buf);
                     self.source_mgr.report_failure(&source);
                     return SegOutcome::Failed;
                 }
@@ -351,6 +367,12 @@ impl DownloadWorker {
         killed: &mut bool,
     ) -> ChunkAction {
         if self.cancel_token.is_cancelled() {
+            // 刷盘保留已收字节（进度计数已含缓冲数据），取消后才能干净续传
+            if let Err(e) = buf.flush() {
+                tracing::warn!("worker {} 取消刷盘失败: {}", self.worker_id, e);
+                self.source_mgr.report_failure(source);
+                return ChunkAction::Outcome(SegOutcome::Failed);
+            }
             return ChunkAction::Outcome(SegOutcome::Cancelled);
         }
         // 暂停检测：刷盘后归还段，等待恢复

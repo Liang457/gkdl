@@ -54,7 +54,8 @@ impl TokenBucket {
         let rate = self.inner.rate.load(Ordering::Relaxed);
         let mut tokens = self.inner.tokens.load(Ordering::Relaxed);
         let add = (elapsed * rate as f64) as u64;
-        tokens = (tokens + add).min(rate); // 最多攒 1 秒
+        // 饱和加法：极端配置（超大 rate）下 elapsed*rate 会溢出 u64，panic/回绕
+        tokens = tokens.saturating_add(add).min(rate); // 最多攒 1 秒
         self.inner.tokens.store(tokens, Ordering::Relaxed);
         *last = now;
     }

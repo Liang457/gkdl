@@ -40,10 +40,10 @@ struct TrayApp {
     tx: mpsc::UnboundedSender<TrayCommand>,
     config_dir: PathBuf,
     log_dir: PathBuf,
-    aria2ng_url: Option<String>,
+    aria_ng_url: Option<String>,
     open_config_id: muda::MenuId,
     open_log_id: muda::MenuId,
-    open_aria2ng_id: Option<muda::MenuId>,
+    open_aria_ng_id: Option<muda::MenuId>,
     quit_id: muda::MenuId,
     _tray: TrayIcon,
 }
@@ -56,8 +56,8 @@ impl TrayApp {
                 open_folder(&self.config_dir);
             } else if ev.id == self.open_log_id {
                 open_folder(&self.log_dir);
-            } else if self.open_aria2ng_id.as_ref().is_some_and(|id| ev.id == *id) {
-                if let Some(url) = &self.aria2ng_url {
+            } else if self.open_aria_ng_id.as_ref().is_some_and(|id| ev.id == *id) {
+                if let Some(url) = &self.aria_ng_url {
                     open_browser(url);
                 }
             } else if ev.id == self.quit_id {
@@ -96,10 +96,10 @@ pub fn spawn_tray(
     tx: mpsc::UnboundedSender<TrayCommand>,
     config_dir: PathBuf,
     log_dir: PathBuf,
-    aria2ng_url: Option<String>,
+    aria_ng_url: Option<String>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        if let Err(e) = run_tray(tx, config_dir, log_dir, aria2ng_url) {
+        if let Err(e) = run_tray(tx, config_dir, log_dir, aria_ng_url) {
             tracing::warn!("托盘启动失败: {e}");
         }
     })
@@ -109,7 +109,7 @@ fn run_tray(
     tx: mpsc::UnboundedSender<TrayCommand>,
     config_dir: PathBuf,
     log_dir: PathBuf,
-    aria2ng_url: Option<String>,
+    aria_ng_url: Option<String>,
 ) -> Result<()> {
     let mut builder = EventLoop::builder();
     #[cfg(target_os = "windows")]
@@ -122,11 +122,11 @@ fn run_tray(
     let quit_item = MenuItem::new("退出", true, None);
     menu.append(&open_config)?;
     menu.append(&open_log)?;
-    let open_aria2ng_id = if let Some(url) = &aria2ng_url {
+    let open_aria_ng_id = if let Some(url) = &aria_ng_url {
         if url.is_empty() {
             None
         } else {
-            let item = MenuItem::new("打开 aria2ng", true, None);
+            let item = MenuItem::new("打开 AriaNG", true, None);
             let id = item.id().clone();
             menu.append(&item)?;
             Some(id)
@@ -147,10 +147,10 @@ fn run_tray(
         tx,
         config_dir,
         log_dir,
-        aria2ng_url,
+        aria_ng_url,
         open_config_id: open_config.id().clone(),
         open_log_id: open_log.id().clone(),
-        open_aria2ng_id,
+        open_aria_ng_id,
         quit_id: quit_item.id().clone(),
         _tray: tray,
     };
