@@ -11,3 +11,6 @@ logs/
 
 .qoder/
 .other/
+
+# opencode 自定义命令
+.opencode/

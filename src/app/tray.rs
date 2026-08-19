@@ -14,26 +14,21 @@ pub enum TrayCommand {
     Quit,
 }
 
-/// 生成 32x32 RGBA 托盘图标（蓝色圆角方块 + 白色竖条）。
+/// 从内嵌的 assets/icon.ico 解码图像作为托盘图标（与 exe 图标同源，单一来源）。
+/// 优先取 32x32 帧；缺失时回退到尺寸最大的图像，避免图标缺少 32x32 帧导致整个托盘启动失败。
 fn build_icon() -> Result<Icon> {
-    const SIZE: u32 = 32;
-    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let corner = (x < 6 && y < 6)
-                || (x < 6 && y >= SIZE - 6)
-                || (x >= SIZE - 6 && y < 6)
-                || (x >= SIZE - 6 && y >= SIZE - 6);
-            if corner {
-                rgba.extend_from_slice(&[0, 0, 0, 0]);
-            } else if (12..20).contains(&x) && (8..24).contains(&y) {
-                rgba.extend_from_slice(&[255, 255, 255, 255]);
-            } else {
-                rgba.extend_from_slice(&[52, 152, 219, 255]);
-            }
-        }
-    }
-    Ok(Icon::from_rgba(rgba, SIZE, SIZE)?)
+    let bytes = include_bytes!("../../assets/icon.ico");
+    let dir = ico::IconDir::read(std::io::Cursor::new(bytes))?;
+    let entry = dir
+        .entries()
+        .iter()
+        .filter(|e| e.width() == 32)
+        .max_by_key(|e| e.bits_per_pixel())
+        .or_else(|| dir.entries().iter().max_by_key(|e| e.width() * e.height()))
+        .and_then(|e| e.decode().ok())
+        .ok_or_else(|| anyhow::anyhow!("icon.ico 中没有可解码的图像"))?;
+    let (w, h) = (entry.width(), entry.height());
+    Ok(Icon::from_rgba(entry.rgba_data().to_vec(), w, h)?)
 }
 
 struct TrayApp {

@@ -26,6 +26,7 @@ AriaNg ──▶ gkdl daemon
 - **下载后命令** — 成功后触发，可传参 + 环境变量
 - **aria2 兼容 RPC** — 支持 AriaNg，HTTP / JSONP / WebSocket，token 鉴权
 - **系统托盘** — 常驻后台，托盘直达 AriaNg
+- **图标可自定义** — 托盘与 exe 图标共用 `assets/icon.ico`（多尺寸 ICO），替换该文件后重新构建即生效
 
 ## 快速开始
 

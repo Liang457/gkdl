@@ -1,6 +1,6 @@
 [package]
 name = "gkdl"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 
 [dependencies]
@@ -32,6 +32,8 @@ xz2 = "0.1"
 tray-icon = "0.24"
 muda = "0.19"
 winit = "0.30"
+# 托盘图标与 exe 图标共用 assets/icon.ico（ICO 解码）
+ico = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

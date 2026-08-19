@@ -184,6 +184,8 @@ impl WorkStealingScheduler {
 
     /// 供持久化使用的轻量段快照：只取库表所需字段，不克隆 `speed_history` 等运行时数据，
     /// 避免监控协程每秒全量克隆造成堆分配抖动。
+    /// `end` 钳制到 `i64::MAX`：流式未知大小用 `u64::MAX` 作哨兵，SQLite 存 i64
+    /// （rusqlite 对超出 `i64::MAX` 的 u64 报错），不钳制会让流式下载每秒保存状态失败。
     pub async fn segment_records(&self) -> Vec<SegmentRecord> {
         let guard = self.segments.lock().await;
         guard
@@ -191,7 +193,7 @@ impl WorkStealingScheduler {
             .map(|s| SegmentRecord {
                 seg_id: s.seg_id,
                 start: s.start,
-                end: s.end,
+                end: s.end.min(i64::MAX as u64),
                 written: s.written,
                 complete: s.state == SegmentState::Complete,
             })
@@ -686,5 +688,16 @@ mod tests {
         sched.update_progress(0, 600, None).await;
         let segs = sched.segments().await;
         assert_eq!(segs[0].speed_history.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn segment_records_clamps_streaming_sentinel_end() {
+        // 回归：流式未知大小段以 u64::MAX 作 end 哨兵，SQLite 存 i64，
+        // 不钳制会让持久化报错（rusqlite 拒绝超出 i64::MAX 的 u64）。
+        let sched = WorkStealingScheduler::streaming(cfg(), None);
+        let recs = sched.segment_records().await;
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].end, i64::MAX as u64);
+        assert!(recs[0].end < u64::MAX);
     }
 }
