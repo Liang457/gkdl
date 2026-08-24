@@ -9,6 +9,7 @@ use crate::download::source::SourceManager;
 use crate::download::worker::DownloadWorker;
 use crate::download::writer::{DownloadWriter, MemoryWriter, StreamingWriter};
 use anyhow::{anyhow, bail, Context, Result};
+use curl::easy::Easy;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -105,17 +106,6 @@ impl DownloadHandle {
             }
         }
     }
-}
-
-async fn probe(
-    client: &HttpClient,
-    url: &str,
-    cancel: &CancellationToken,
-    timeout: u64,
-) -> Result<ProbeInfo> {
-    // 用 GET Range: bytes=0-0 权威探测总长与 Range 支持
-    // （有些服务器 HEAD 谎报 Accept-Ranges，必须实测）
-    client.probe(url, cancel, timeout).await
 }
 
 /// 判定是否走「整文件流式 + gzip/deflate」路径：仅当允许压缩且该下载无法/无需分段时。
@@ -245,16 +235,20 @@ pub async fn start_download(
     let client = build_client(&config)?;
     let client = Arc::new(client);
 
-    // 探测：逐个源尝试，第一个成功的作为主源；失败源禁用
+    // 探测：逐个源尝试，第一个成功的作为主源；失败源禁用。
+    // 探测「干净收尾」（206 完整消费）时保留 Easy 句柄，其连接缓存里的
+    // 空闲连接交给 worker 0 复用，省去一次 DNS/TCP/TLS 握手。
     let mut probe_info: Option<ProbeInfo> = None;
     let mut failed_urls: Vec<String> = Vec::new();
+    let mut warm_conn: Option<(String, Easy)> = None;
     for url in &urls {
         if cancel_token.is_cancelled() {
             bail!("下载已取消");
         }
-        match probe(&client, url, &cancel_token, config.timeout).await {
-            Ok(info) => {
+        match client.probe(url, &cancel_token, config.timeout).await {
+            Ok((info, warm)) => {
                 probe_info = Some(info);
+                warm_conn = warm.map(|e| (url.clone(), e));
                 break;
             }
             Err(e) => {
@@ -280,15 +274,7 @@ pub async fn start_download(
     }
 
     let path = match out_path {
-        Some(p) => {
-            if let Some(parent) = p.parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent)
-                        .with_context(|| format!("创建目录失败: {}", parent.display()))?;
-                }
-            }
-            p
-        }
+        Some(p) => p,
         None => PathBuf::from(filename_from_url(&urls[0])),
     };
 
@@ -299,23 +285,35 @@ pub async fn start_download(
                 .memory_threshold
                 .min(crate::download::config::MEMORY_THRESHOLD_CAP);
 
-    // 磁盘续传前提：磁盘文件已存在、长度与探测一致，且服务器支持 Range。
-    // 若输出文件被删而记录残留，直接续传会用全 0 占位并跳过 Complete 段 → 损坏；
-    // 无 Range 支持时 worker 只能整文件从头下载，无法按偏移续传。
-    let file_ok = std::fs::metadata(&path)
-        .map(|m| m.len() == probe.total)
-        .unwrap_or(false);
-
-    // 尝试续传（查状态库）；流式/压缩下载无法按偏移续传，跳过
-    let resume_record = if streaming {
-        None
-    } else {
-        db.as_ref().and_then(|db| {
-            db.find_resume(&path.display().to_string(), &urls, probe.total)
-                .ok()
-                .flatten()
+    // 建目录/stat/查续传记录均为同步 IO（网络盘或大目录下可能明显变慢），
+    // 移入阻塞线程执行，避免卡住异步运行时、拖迟下载启动。
+    let prep_path = path.clone();
+    let prep_urls = urls.clone();
+    let prep_db = db.clone();
+    let (file_ok, resume_record) =
+        tokio::task::spawn_blocking(move || -> Result<(bool, Option<DownloadRecord>)> {
+            if let Some(parent) = prep_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("创建目录失败: {}", parent.display()))?;
+                }
+            }
+            // 磁盘续传前提：磁盘文件已存在、长度与探测一致，且服务器支持 Range。
+            // 若输出文件被删而记录残留，直接续传会用全 0 占位并跳过 Complete 段 → 损坏；
+            // 无 Range 支持时 worker 只能整文件从头下载，无法按偏移续传。
+            let file_ok = std::fs::metadata(&prep_path)
+                .map(|m| m.len() == probe.total)
+                .unwrap_or(false);
+            // 尝试续传（查状态库）；流式/压缩下载无法按偏移续传，跳过
+            let record = prep_db.as_ref().and_then(|db| {
+                db.find_resume(&prep_path.display().to_string(), &prep_urls, probe.total)
+                    .ok()
+                    .flatten()
+            });
+            Ok((file_ok, record))
         })
-    };
+        .await
+        .context("续传准备任务异常退出")??;
 
     let mut resumed = false;
     let mut memory_mode = current_opt;
@@ -379,15 +377,50 @@ pub async fn start_download(
         }
     );
 
-    let writer: Arc<dyn DownloadWriter> = if streaming {
-        Arc::new(StreamingWriter::new(&path)?)
-    } else if memory_mode {
-        Arc::new(MemoryWriter::new(probe.total))
-    } else if resumed {
-        Arc::new(PwriteWriter::resume(&path, probe.total)?)
-    } else {
-        Arc::new(PwriteWriter::new(&path, probe.total)?)
-    };
+    // 初始段表快照（异步侧取好再交给阻塞线程写库）
+    let init_segments: Vec<SegmentRecord> = scheduler.segment_records().await;
+
+    // 文件预分配（set_len）在 HDD/网络盘上可能耗时数秒，连同初始状态落库
+    // 一并移入阻塞线程，避免卡住异步运行时。
+    let wpath = path.clone();
+    let wdb = db.clone();
+    let wgid = gid.clone();
+    let wurls = urls.clone();
+    let wsha256 = sha256.clone();
+    let wcfg = config.clone();
+    let writer = tokio::task::spawn_blocking(move || -> Result<Arc<dyn DownloadWriter>> {
+        let writer: Arc<dyn DownloadWriter> = if streaming {
+            Arc::new(StreamingWriter::new(&wpath)?)
+        } else if memory_mode {
+            Arc::new(MemoryWriter::new(probe.total))
+        } else if resumed {
+            Arc::new(PwriteWriter::resume(&wpath, probe.total)?)
+        } else {
+            Arc::new(PwriteWriter::new(&wpath, probe.total)?)
+        };
+
+        // 先落一次初始状态（探测完成、调度器就绪）
+        if let Some(db) = &wdb {
+            let rec = make_record(
+                &wgid,
+                &wurls,
+                probe.total,
+                &wpath.display().to_string(),
+                &wsha256,
+                &wcfg,
+                memory_mode,
+                "active",
+                init_segments,
+            );
+            if let Err(e) = db.upsert_download(&rec) {
+                tracing::warn!("写入初始下载状态失败: {}", e);
+            }
+        }
+        Ok(writer)
+    })
+    .await
+    .context("文件初始化任务异常退出")??;
+
     let source_mgr = Arc::new(SourceManager::new(&urls));
     for u in &failed_urls {
         source_mgr.disable(u);
@@ -402,25 +435,6 @@ pub async fn start_download(
     let supports_range = probe.supports_range;
     let start = Instant::now();
 
-    // 先落一次初始状态（探测完成、调度器就绪）
-    if let Some(db) = &db {
-        let segments: Vec<SegmentRecord> = scheduler.segment_records().await;
-        let rec = make_record(
-            &gid,
-            &urls,
-            total,
-            &path.display().to_string(),
-            &sha256,
-            &config,
-            memory_mode,
-            "active",
-            segments,
-        );
-        if let Err(e) = db.upsert_download(&rec) {
-            tracing::warn!("写入初始下载状态失败: {}", e);
-        }
-    }
-
     // 后台任务：监控 + 保存状态 + workers + 校验
     let sched_task = Arc::clone(&scheduler);
     let writer_task = Arc::clone(&writer);
@@ -433,6 +447,7 @@ pub async fn start_download(
     let cfg_task = config.clone();
     let db_task = db;
     let gid_task = gid.clone();
+    let mut warm_for_worker = warm_conn;
 
     let join = tokio::spawn(async move {
         let result: Result<DownloadReport> = (async {
@@ -500,6 +515,7 @@ pub async fn start_download(
             let worker_count = if streaming { 1 } else { cfg_task.split.max(1) };
             let mut handles = Vec::new();
             for i in 0..worker_count {
+                // 探测预热连接只交给 worker 0（首个流消费一次）
                 let worker = DownloadWorker::new(
                     i,
                     Arc::clone(&client_task),
@@ -512,6 +528,11 @@ pub async fn start_download(
                     streaming,
                     cancel_task.clone(),
                 );
+                let worker = if i == 0 {
+                    worker.with_warm_conn(warm_for_worker.take())
+                } else {
+                    worker
+                };
                 handles.push(tokio::spawn(async move { worker.run().await }));
             }
 

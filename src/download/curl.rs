@@ -5,7 +5,7 @@
 
 use crate::download::config::DownloadConfig;
 use anyhow::{anyhow, bail, Result};
-use curl::easy::{Easy, List, WriteError};
+use curl::easy::{Easy, HttpVersion, List, WriteError};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -49,7 +49,15 @@ struct HeaderState {
     status: u32,
     content_range: Option<String>,
     content_length: Option<String>,
+    /// 探测已消费的 body 字节数（206 干净收尾用）。
+    consumed: u64,
+    /// 探测中途掐断过 body（此类连接不可复用）。
+    aborted: bool,
 }
+
+/// 探测阶段愿意完整读掉的响应体上限。Range 0-0 的正常响应只有 1 字节；
+/// 留出余量防畸形服务器，超出即掐断（放弃复用）。
+const PROBE_BODY_CAP: u64 = 64 * 1024;
 
 /// 增量解析一行响应头；遇到新的状态行会重置当前块（支持重定向多响应）。
 fn update_header_state(st: &mut HeaderState, data: &[u8]) {
@@ -187,6 +195,19 @@ impl HttpClient {
     ) -> Result<Easy> {
         ensure_curl_init();
         let mut easy = Easy::new();
+        self.apply_request_opts(&mut easy, url, range, encoding)?;
+        Ok(easy)
+    }
+
+    /// 在（新建或探测复用的）句柄上套用全部请求选项。复用句柄时旧回调/URL/Range
+    /// 均被覆盖；探测阶段设置的总超时在此清零（下载依赖低速兜底 + async 侧读超时）。
+    fn apply_request_opts(
+        &self,
+        easy: &mut Easy,
+        url: &str,
+        range: Option<(u64, u64)>,
+        encoding: &str,
+    ) -> Result<()> {
         easy.url(&Self::normalize_url(url))?;
         easy.useragent(&self.user_agent)?;
         if let Some(r) = &self.referer {
@@ -206,18 +227,40 @@ impl HttpClient {
         easy.follow_location(true)?;
         easy.max_redirections(10)?;
         easy.connect_timeout(Duration::from_secs(self.timeout.max(5)))?;
+        // HTTPS 走 HTTP/2（ALPN 协商，失败自动回落 1.1）；HTTP 保持 1.1（不尝试 h2c）。
+        easy.http_version(HttpVersion::V2TLS)?;
         // 低速兜底：服务器长时间无数据传输（卡死/静默）时，让阻塞线程自行退出。
         // 否则 async 侧读超时放弃段、接收端被丢弃后，spawn_blocking 里的 curl 仍会
         // 阻塞在 recv() 上无期限地占用一个 blocking 线程（泄漏）。语义与 async 侧
         // 「两次 chunk 间隔超时」一致：正常传输有数据流动不会触发。
         easy.low_speed_limit(1)?;
         easy.low_speed_time(Duration::from_secs(self.timeout.max(5)))?;
-        Ok(easy)
+        // 清除探测阶段可能设置的整段总超时（0=禁用）
+        easy.timeout(Duration::ZERO)?;
+        Ok(())
     }
 
     /// 分段/探测用的 Easy 句柄：强制 `Accept-Encoding: identity`，拿原始字节。
     pub fn easy(&self, url: &str, range: Option<(u64, u64)>) -> Result<Easy> {
         self.easy_with_encoding(url, range, "identity")
+    }
+
+    /// 分段下载（复用探测阶段建立的连接）：句柄的连接缓存里保留着同主机的
+    /// 空闲连接，跳过 DNS/TCP/TLS 握手直接发请求。仅当探测以「干净收尾」
+    /// 结束时调用方才持有句柄；选项覆盖失败则由调用方回退到新建连接。
+    /// 先 `reset()` 清掉探测残留选项（Range/总超时/旧回调）——reset 不清
+    /// 连接缓存，空闲连接仍然可复用。
+    pub fn stream_segment_warm(
+        &self,
+        mut easy: Easy,
+        url: &str,
+        range: Option<(u64, u64)>,
+    ) -> Result<(
+        tokio::sync::mpsc::Receiver<CurlMsg>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        easy.reset();
+        self.stream_impl_with(easy, url, range, "identity")
     }
 
     /// 阻塞线程中发起流式分段下载：返回消息接收端与后台任务句柄。
@@ -245,6 +288,19 @@ impl HttpClient {
         self.stream_impl(url, None, "gzip, deflate")
     }
 
+    /// 整文件流式下载的预热句柄变体（语义同 `stream_segment_warm`）。
+    pub fn stream_whole_warm(
+        &self,
+        mut easy: Easy,
+        url: &str,
+    ) -> Result<(
+        tokio::sync::mpsc::Receiver<CurlMsg>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        easy.reset();
+        self.stream_impl_with(easy, url, None, "gzip, deflate")
+    }
+
     fn stream_impl(
         &self,
         url: &str,
@@ -255,7 +311,23 @@ impl HttpClient {
         tokio::task::JoinHandle<()>,
     )> {
         ensure_curl_init();
-        let mut easy = self.easy_with_encoding(url, range, encoding)?;
+        let easy = self.easy_with_encoding(url, range, encoding)?;
+        self.stream_impl_with(easy, url, range, encoding)
+    }
+
+    /// 流式下载的公共实现：`easy` 可为新建句柄或探测复用的预热句柄。
+    fn stream_impl_with(
+        &self,
+        mut easy: Easy,
+        url: &str,
+        range: Option<(u64, u64)>,
+        encoding: &str,
+    ) -> Result<(
+        tokio::sync::mpsc::Receiver<CurlMsg>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        ensure_curl_init();
+        self.apply_request_opts(&mut easy, url, range, encoding)?;
         let (tx, rx) = tokio::sync::mpsc::channel::<CurlMsg>(4);
 
         // 头回调：状态行更新 status，空行表示一个响应头块结束 → 发送 Headers。
@@ -313,25 +385,27 @@ impl HttpClient {
         });
         Ok((rx, handle))
     }
-
     /// 异步探测：GET `Range: bytes=0-0` 权威探测总长与 Range 支持，可被取消。
+    /// 成功且连接「干净收尾」时一并返回该 Easy 句柄——其连接缓存保留了到
+    /// 目标主机的空闲连接，可供首个 worker 复用（省一次 DNS/TCP/TLS 握手）。
     pub async fn probe(
         &self,
         url: &str,
         cancel: &CancellationToken,
         timeout: u64,
-    ) -> Result<ProbeInfo> {
+    ) -> Result<(ProbeInfo, Option<Easy>)> {
         let this = self.clone();
         let url_owned = url.to_string();
-        let (tx, rx) = tokio::sync::oneshot::channel::<Result<ProbeInfo, String>>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<(Result<ProbeInfo, String>, Option<Easy>)>();
         let join = tokio::task::spawn_blocking(move || {
             let result = this.probe_blocking(&url_owned, timeout);
             let _ = tx.send(result);
         });
+
         tokio::select! {
             r = rx => match r {
-                Ok(Ok(info)) => Ok(info),
-                Ok(Err(e)) => Err(anyhow!("探测失败: {e}")),
+                Ok((Ok(info), warm)) => Ok((info, warm)),
+                Ok((Err(e), _)) => Err(anyhow!("探测失败: {e}")),
                 Err(_) => Err(anyhow!("探测任务异常退出")),
             },
             _ = cancel.cancelled() => {
@@ -341,55 +415,89 @@ impl HttpClient {
         }
     }
 
-    /// 阻塞探测实现（在 spawn_blocking 内执行）。
-    fn probe_blocking(&self, url: &str, timeout: u64) -> Result<ProbeInfo, String> {
+    /// 阻塞探测实现（在 spawn_blocking 内执行）。返回值第二项为可复用的
+    /// Easy 句柄：仅当 206 响应被完整消费（传输干净结束、空闲连接入缓存）
+    /// 时才有值；掐断过 body 或请求失败均返回 None。
+    fn probe_blocking(&self, url: &str, timeout: u64) -> (Result<ProbeInfo, String>, Option<Easy>) {
         let url = Self::normalize_url(url);
-        let mut easy = self
-            .easy(&url, Some((0, 0)))
-            .map_err(|e| format!("{e:#}"))?;
-        easy.timeout(Duration::from_secs(timeout.max(5)))
-            .map_err(|e| curl_error_text(&e))?;
+        let mut easy = match self.easy(&url, Some((0, 0))) {
+            Ok(e) => e,
+            Err(e) => return (Err(format!("{e:#}")), None),
+        };
+        if let Err(e) = easy.timeout(Duration::from_secs(timeout.max(5))) {
+            return (Err(curl_error_text(&e)), None);
+        }
 
         let state = Arc::new(Mutex::new(HeaderState::default()));
         let cb = Arc::clone(&state);
-        easy.header_function(move |data| {
+        if let Err(e) = easy.header_function(move |data: &[u8]| {
             update_header_state(&mut cb.lock().unwrap(), data);
             true
-        })
-        .map_err(|e| curl_error_text(&e))?;
-        // 收到响应头后立即掐断 body（Ok(0)），忽略由此产生的写错误
-        easy.write_function(|_: &[u8]| -> Result<usize, WriteError> { Ok(0) })
-            .map_err(|e| curl_error_text(&e))?;
+        }) {
+            return (Err(curl_error_text(&e)), None);
+        }
+        // 206：完整读掉极小的 body（Range 0-0 → 1 字节），让 perform 干净结束、
+        // 空闲连接进入句柄缓存供首个 worker 复用；其余状态码（200 整文件/重定向
+        // 带体等）：立即掐断，避免为探测拖回整个文件（此类连接不可复用）。
+        let cb_write = Arc::clone(&state);
+        if let Err(e) = easy.write_function(move |data: &[u8]| -> Result<usize, WriteError> {
+            let mut st = cb_write.lock().unwrap();
+            if st.status == 206 && st.consumed + data.len() as u64 <= PROBE_BODY_CAP {
+                st.consumed += data.len() as u64;
+                Ok(data.len())
+            } else {
+                st.aborted = true;
+                Ok(0) // curl 以 CURLE_WRITE_ERROR 中止
+            }
+        }) {
+            return (Err(curl_error_text(&e)), None);
+        }
 
         let perf = easy.perform();
         let st = state.lock().unwrap();
         let status = st.status;
         let content_range = st.content_range.clone();
         let content_length = st.content_length.clone();
+        // 「干净收尾」要求 perform 本身成功：中途出错（partial/recv error 等）
+        // 时连接状态不可信，即使头部是完整 206 也不交给下游复用。
+        let reusable = status == 206 && !st.aborted && perf.is_ok();
         drop(st);
 
         if status == 0 {
-            return Err(match perf {
+            let msg = match perf {
                 Ok(_) => "无响应".to_string(),
                 Err(e) => curl_error_text(&e),
-            });
+            };
+            return (Err(msg), None);
         }
 
         if status == 206 {
             // Content-Range: bytes 0-0/12345
-            let total = content_range
+            let total = match content_range
                 .as_deref()
                 .and_then(|cr| cr.split('/').nth(1))
                 .and_then(|s| s.trim().parse::<u64>().ok())
-                .ok_or_else(|| format!("206 响应缺少 Content-Range: {content_range:?}"))?;
+            {
+                Some(t) => t,
+                None => {
+                    return (
+                        Err(format!("206 响应缺少 Content-Range: {content_range:?}")),
+                        None,
+                    )
+                }
+            };
             if total == 0 {
-                return Err("文件大小为 0".to_string());
+                return (Err("文件大小为 0".to_string()), None);
             }
-            Ok(ProbeInfo {
-                total,
-                total_known: true,
-                supports_range: true,
-            })
+            let warm = reusable.then_some(easy);
+            (
+                Ok(ProbeInfo {
+                    total,
+                    total_known: true,
+                    supports_range: true,
+                }),
+                warm,
+            )
         } else if status == 200 {
             // 总长兜底：优先 GET 的 Content-Length，缺失时 HEAD；都拿不到则视为大小未知
             // （是否接受未知大小由引擎结合 allow_compression 决定）
@@ -399,22 +507,28 @@ impl HttpClient {
                 .or(head_total);
             if let Some(total) = total {
                 if total == 0 {
-                    return Err("文件大小为 0".to_string());
+                    return (Err("文件大小为 0".to_string()), None);
                 }
-                Ok(ProbeInfo {
-                    total,
-                    total_known: true,
-                    supports_range: false,
-                })
+                (
+                    Ok(ProbeInfo {
+                        total,
+                        total_known: true,
+                        supports_range: false,
+                    }),
+                    None, // body 被掐断，连接不可复用
+                )
             } else {
-                Ok(ProbeInfo {
-                    total: 0,
-                    total_known: false,
-                    supports_range: false,
-                })
+                (
+                    Ok(ProbeInfo {
+                        total: 0,
+                        total_known: false,
+                        supports_range: false,
+                    }),
+                    None,
+                )
             }
         } else {
-            Err(format!("探测失败: HTTP {status}"))
+            (Err(format!("探测失败: HTTP {status}")), None)
         }
     }
 

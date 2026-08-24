@@ -6,8 +6,13 @@ use crate::download::segment::Segment;
 use crate::download::source::{Source, SourceManager};
 use crate::download::writer::DownloadWriter;
 use anyhow::Result;
+use curl::easy::Easy;
 use std::sync::Arc;
 use std::time::Instant;
+
+/// 预热连接：探测阶段「干净收尾」留下的 Easy 句柄（URL, 句柄）。
+/// 句柄的连接缓存含到目标主机的空闲连接，首个流可跳过 DNS/TCP/TLS 握手。
+type WarmConn = (String, Easy);
 
 enum SegOutcome {
     Complete,
@@ -40,6 +45,9 @@ pub struct DownloadWorker {
     /// 流式（单连接整文件）模式：无 Range、可 gzip/deflate、流结束即完成、重试从头开始。
     streaming: bool,
     cancel_token: tokio_util::sync::CancellationToken,
+    /// 探测预热连接（仅 worker 0 持有，首个流且源匹配时消费一次）。
+    /// `run(&self)` 以共享引用运行且跨 await，用 Mutex 实现一次性取出。
+    warm_conn: std::sync::Mutex<Option<WarmConn>>,
 }
 
 /// 每 worker 的写缓冲。
@@ -111,7 +119,14 @@ impl DownloadWorker {
             supports_range,
             streaming,
             cancel_token,
+            warm_conn: std::sync::Mutex::new(None),
         }
+    }
+
+    /// 附带探测预热连接的构造（仅 worker 0 使用）。
+    pub fn with_warm_conn(mut self, warm: Option<WarmConn>) -> Self {
+        self.warm_conn = std::sync::Mutex::new(warm);
+        self
     }
 
     pub async fn run(&self) {
@@ -176,6 +191,17 @@ impl DownloadWorker {
 
         let start = seg.position_to_write();
         let end = seg.end; // exclusive
+
+        // 预热连接仅在「首个流 + 源匹配」时消费一次；不匹配或复用失败则
+        // 静默回退到新建连接（预热只是优化，绝不影响正确性）。
+        // 检查与取出在同一次加锁内完成，不留锁窗口。
+        let warm = {
+            let mut guard = self.warm_conn.lock().unwrap();
+            match guard.as_ref() {
+                Some((url, _)) if *url == source.url => guard.take(),
+                _ => None,
+            }
+        };
         let (mut rx, _handle) = if self.streaming {
             // 流式整文件：无 Range，允许 gzip/deflate（libcurl 自动解压）；
             // 重试/恢复无法断点，截断文件并从头部重新下载。
@@ -188,7 +214,21 @@ impl DownloadWorker {
             seg.tick_bytes = 0;
             seg.clear_speed();
             self.scheduler.reset_written(seg.seg_id).await;
-            match self.client.stream_whole(&source.url) {
+            let opened = match warm {
+                Some((_, easy)) => match self.client.stream_whole_warm(easy, &source.url) {
+                    Ok(v) => Ok(v),
+                    Err(e) => {
+                        tracing::debug!(
+                            "worker {} 预热连接启动流式下载失败，回退新建连接: {}",
+                            self.worker_id,
+                            e
+                        );
+                        self.client.stream_whole(&source.url)
+                    }
+                },
+                None => self.client.stream_whole(&source.url),
+            };
+            match opened {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::debug!("worker {} 创建流式下载失败: {}", self.worker_id, e);
@@ -202,7 +242,23 @@ impl DownloadWorker {
             } else {
                 None
             };
-            match self.client.stream_segment(&source.url, range) {
+            let opened = match warm {
+                Some((_, easy)) => {
+                    match self.client.stream_segment_warm(easy, &source.url, range) {
+                        Ok(v) => Ok(v),
+                        Err(e) => {
+                            tracing::debug!(
+                                "worker {} 预热连接启动分段下载失败，回退新建连接: {}",
+                                self.worker_id,
+                                e
+                            );
+                            self.client.stream_segment(&source.url, range)
+                        }
+                    }
+                }
+                None => self.client.stream_segment(&source.url, range),
+            };
+            match opened {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::debug!("worker {} 创建下载流失败: {}", self.worker_id, e);
