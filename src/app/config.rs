@@ -59,6 +59,8 @@ pub struct HookConfigFile {
     /// 下载后命令配置文件（每行一条命令），相对路径基于配置目录解析；空则用默认 hooks.txt
     pub commands_file: String,
     pub timeout_sec: u64,
+    /// 运行下载后命令时不弹出命令行窗口（Windows；仅影响控制台类子进程），默认 true
+    pub hide_window: bool,
 }
 
 impl Default for HookConfigFile {
@@ -66,6 +68,7 @@ impl Default for HookConfigFile {
         Self {
             commands_file: "hooks.txt".into(),
             timeout_sec: 60,
+            hide_window: true,
         }
     }
 }
@@ -174,6 +177,7 @@ mod tests {
         assert_eq!(loaded.daemon.port, 6800);
         assert_eq!(loaded.download.split, 8);
         assert_eq!(loaded.log.retention_days, 90);
+        assert!(loaded.hook.hide_window);
         std::fs::remove_file(&p).ok();
     }
 
@@ -199,5 +203,16 @@ hook:
         assert_eq!(cfg.download.split, 4);
         assert_eq!(cfg.log.level, "debug");
         assert_eq!(cfg.hook.commands_file, "C:/x/hooks.txt");
+        assert!(cfg.hook.hide_window);
+    }
+
+    #[test]
+    fn hook_hide_window_false_parses() {
+        let yaml = r#"
+hook:
+  hide_window: false
+"#;
+        let cfg: Config = yaml_serde::from_str(yaml).unwrap();
+        assert!(!cfg.hook.hide_window);
     }
 }

@@ -86,6 +86,7 @@ state:
 hook:
   commands_file: "hooks.txt"  # 下载后命令文件，每行一条
   timeout_sec: 60
+  hide_window: true            # 命令不弹出命令行窗口（Windows），false 则恢复弹窗
 ```
 
 ### 压缩传输（gzip/deflate）
@@ -101,6 +102,8 @@ hook:
 ## 下载后命令
 
 daemon 模式读 `hooks.txt`（首次自动生成），每行一条命令，下载文件路径作为最后一个参数传入；`.ps1` 用 `powershell -NoProfile -NonInteractive -File` 执行。可用环境变量 `GKDL_URL / GKDL_GID / GKDL_SIZE / GKDL_SHA256`。仅任务成功且 SHA-256 通过后触发。CLI 直连模式用 `--post-script <script>` 指定单个脚本。
+
+命令默认以 `hook.hide_window: true` **静默运行**（`CREATE_NO_WINDOW`，控制台类子进程如 `powershell`/`.bat` 不弹出黑窗口），stdout/stderr 仍转发到日志；设为 `false` 可恢复弹窗（便于调试交互式命令，但交互命令会在无控制台环境下挂起直至超时，建议 hook 使用非交互命令）。
 
 ## 目录结构
 

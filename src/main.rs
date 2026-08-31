@@ -320,6 +320,7 @@ async fn run_daemon(args: DaemonArgs) -> i32 {
             commands_file: Some(commands_file),
             script: None,
             timeout_sec: file_cfg.hook.timeout_sec,
+            hide_window: file_cfg.hook.hide_window,
         }
     };
 

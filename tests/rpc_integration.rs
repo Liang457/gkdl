@@ -49,6 +49,8 @@ async fn post_download_hook_runs_after_success() {
         script: Some(script.clone()),
         commands_file: None,
         timeout_sec: 30,
+        // hide_window 开启：.bat 子进程以 CREATE_NO_WINDOW 静默运行，仍应正常执行并输出
+        hide_window: true,
     };
     let mgr = TaskManager::new(hook, DownloadConfig::default(), None);
     let gid = mgr

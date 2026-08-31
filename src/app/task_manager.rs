@@ -588,6 +588,7 @@ impl TaskManager {
             size,
             sha256: sha256.as_deref(),
             timeout,
+            hide_window: self.hook.hide_window,
         };
 
         // 命令列表文件：每行一条命令，逐条执行

@@ -11,6 +11,8 @@ pub struct HookConfig {
     /// 旧式单脚本方式（CLI --post-script 使用）。
     pub script: Option<PathBuf>,
     pub timeout_sec: u64,
+    /// 子进程不弹出命令行窗口（Windows），默认 true。
+    pub hide_window: bool,
 }
 
 impl Default for HookConfig {
@@ -19,6 +21,7 @@ impl Default for HookConfig {
             commands_file: None,
             script: None,
             timeout_sec: 60,
+            hide_window: true,
         }
     }
 }
@@ -32,6 +35,8 @@ pub struct HookContext<'a> {
     pub size: u64,
     pub sha256: Option<&'a str>,
     pub timeout: u64,
+    /// 子进程不弹出命令行窗口（Windows）。
+    pub hide_window: bool,
 }
 
 /// 读取命令列表文件：每行一条命令，空行与 `#` 注释被忽略。
@@ -91,9 +96,17 @@ fn build_command(program: &str, args: &[String], file_str: &str) -> Command {
 }
 
 /// 逐行转发子进程 stdout/stderr 到日志，等待退出（超时则终止）。
-async fn spawn_and_wait(mut cmd: Command, timeout_sec: u64) -> Result<()> {
+async fn spawn_and_wait(mut cmd: Command, timeout_sec: u64, hide_window: bool) -> Result<()> {
     cmd.stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        // 兜底：若本函数所在的 future 被取消（如守护进程退出），杀掉子进程而非任其游离
+        .kill_on_drop(true);
+
+    #[cfg(windows)]
+    if hide_window {
+        // CREATE_NO_WINDOW = 0x08000000：控制台类子进程（powershell/.bat 等）不弹出窗口
+        cmd.creation_flags(0x0800_0000);
+    }
 
     let mut child = cmd.spawn()?;
 
@@ -119,30 +132,38 @@ async fn spawn_and_wait(mut cmd: Command, timeout_sec: u64) -> Result<()> {
         })
     });
 
-    let timeout = Duration::from_secs(timeout_sec);
-    let status = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(st)) => st,
+    // 子进程退出/被终止后管道到达 EOF，转发任务自然结束；统一回收避免孤儿任务持有管道句柄。
+    // 用超时兜底：若子进程派生了继承管道句柄的后代进程导致迟迟不 EOF，也不无限挂起，
+    // 放弃剩余日志立即返回（绝不因 hook 卡死下载驱动协程）。
+    async fn drain(
+        out: Option<tokio::task::JoinHandle<()>>,
+        err: Option<tokio::task::JoinHandle<()>>,
+    ) {
+        let cap = Duration::from_secs(5);
+        for task in out.into_iter().chain(err) {
+            let _ = tokio::time::timeout(cap, task).await;
+        }
+    }
+
+    // 超时时间至少 1 秒，避免配置 0 导致命令被立刻终止
+    let timeout = Duration::from_secs(timeout_sec.max(1));
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => {
+            drain(out_task, err_task).await;
+            tracing::info!("命令退出码: {}", status.code().unwrap_or(-1));
+            Ok(())
+        }
         Ok(Err(e)) => {
-            tracing::warn!("命令执行出错: {e}");
             let _ = child.kill().await;
-            return Ok(());
+            drain(out_task, err_task).await;
+            Err(e).context("等待命令退出失败")
         }
         Err(_) => {
-            tracing::warn!("命令执行超时（>{}s），已终止", timeout_sec);
             let _ = child.kill().await;
-            return Ok(());
+            drain(out_task, err_task).await;
+            anyhow::bail!("命令执行超时（>{timeout_sec}s），已终止")
         }
-    };
-
-    if let Some(t) = out_task {
-        t.await.ok();
     }
-    if let Some(t) = err_task {
-        t.await.ok();
-    }
-
-    tracing::info!("命令退出码: {}", status.code().unwrap_or(-1));
-    Ok(())
 }
 
 fn apply_env(cmd: &mut Command, ctx: &HookContext<'_>) {
@@ -168,7 +189,7 @@ pub async fn run_post_download_command(command: &str, ctx: HookContext<'_>) -> R
 
     let mut cmd = build_command(&program, args, &file_str);
     apply_env(&mut cmd, &ctx);
-    spawn_and_wait(cmd, ctx.timeout).await
+    spawn_and_wait(cmd, ctx.timeout, ctx.hide_window).await
 }
 
 /// 依次运行下载后命令列表，单条失败不中断后续命令。
@@ -190,7 +211,7 @@ pub async fn run_post_download_script(script: &Path, ctx: HookContext<'_>) -> Re
 
     let mut cmd = build_command(script.to_str().unwrap_or_default(), &[], &file_str);
     apply_env(&mut cmd, &ctx);
-    spawn_and_wait(cmd, ctx.timeout).await
+    spawn_and_wait(cmd, ctx.timeout, ctx.hide_window).await
 }
 
 #[cfg(test)]
@@ -203,6 +224,7 @@ mod tests {
         assert!(cfg.commands_file.is_none());
         assert!(cfg.script.is_none());
         assert_eq!(cfg.timeout_sec, 60);
+        assert!(cfg.hide_window);
     }
 
     #[test]
@@ -232,5 +254,68 @@ mod tests {
             vec!["C:/Program Files/x.exe", "--opt"]
         );
         assert_eq!(split_command("   "), Vec::<String>::new());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hide_window_command_captures_stdout() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Sink(Arc<Mutex<String>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(buf));
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl tracing_subscriber::fmt::MakeWriter<'_> for Sink {
+            type Writer = Sink;
+            fn make_writer(&self) -> Sink {
+                self.clone()
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(String::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(Sink(captured.clone()))
+            .finish();
+
+        // 单线程运行时：with_default 的订阅者是线程局部的，必须让被派发的
+        // stdout/stderr 转发任务与本线程共享订阅者才能捕获日志
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            rt.block_on(async {
+                let ctx = HookContext {
+                    file_path: std::path::Path::new("x.bin"),
+                    url: "http://x/",
+                    gid: "g",
+                    size: 0,
+                    sha256: None,
+                    timeout: 30,
+                    hide_window: true,
+                };
+                run_post_download_command(
+                    "powershell -NoProfile -Command \"Write-Output silent\"",
+                    ctx,
+                )
+                .await
+                .unwrap();
+            });
+        });
+        let log = captured.lock().unwrap().clone();
+        assert!(
+            log.contains("[hook stdout] silent"),
+            "hide_window 下 stdout 仍应转发到日志: {log}"
+        );
     }
 }
