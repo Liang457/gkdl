@@ -409,6 +409,13 @@ impl WorkStealingScheduler {
         if let Some(t) = guard.iter_mut().find(|s| s.seg_id == seg.seg_id) {
             t.state = SegmentState::Cancelled;
             t.owner_id = usize::MAX;
+            tracing::warn!(
+                "段 {} 重试 {} 次耗尽，放弃（已下载 {}/{} bytes）",
+                t.seg_id,
+                self.config.max_retries,
+                t.written,
+                t.end.saturating_sub(t.start)
+            );
         }
         drop(guard);
         self.failed.store(true, Ordering::Relaxed);

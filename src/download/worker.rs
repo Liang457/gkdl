@@ -231,7 +231,7 @@ impl DownloadWorker {
             match opened {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::debug!("worker {} 创建流式下载失败: {}", self.worker_id, e);
+                    tracing::warn!("worker {} 创建流式下载失败: {}", self.worker_id, e);
                     self.source_mgr.report_failure(&source);
                     return SegOutcome::Failed;
                 }
@@ -261,7 +261,7 @@ impl DownloadWorker {
             match opened {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::debug!("worker {} 创建下载流失败: {}", self.worker_id, e);
+                    tracing::warn!("worker {} 创建下载流失败: {}", self.worker_id, e);
                     self.source_mgr.report_failure(&source);
                     return SegOutcome::Failed;
                 }
@@ -287,7 +287,7 @@ impl DownloadWorker {
             let msg = match tokio::time::timeout(timeout, rx.recv()).await {
                 Ok(v) => v,
                 Err(_) => {
-                    tracing::debug!("worker {} 请求超时", self.worker_id);
+                    tracing::warn!("worker {} 请求超时", self.worker_id);
                     self.source_mgr.report_failure(&source);
                     return SegOutcome::Failed;
                 }
@@ -302,7 +302,7 @@ impl DownloadWorker {
                     if self.cancel_token.is_cancelled() {
                         return SegOutcome::Cancelled;
                     }
-                    tracing::debug!(
+                    tracing::warn!(
                         "worker {} 请求失败: {}",
                         self.worker_id,
                         curl_error_text(&e)
@@ -315,6 +315,10 @@ impl DownloadWorker {
                     break;
                 }
                 None => {
+                    tracing::warn!(
+                        "worker {} 下载通道关闭（curl 线程提前结束）",
+                        self.worker_id
+                    );
                     self.source_mgr.report_failure(&source);
                     return SegOutcome::Failed;
                 }
@@ -328,12 +332,23 @@ impl DownloadWorker {
             status == 200 || status == 206
         };
         if !ok_status {
+            tracing::warn!(
+                "worker {} 收到异常 HTTP 状态 {}: {}",
+                self.worker_id,
+                status,
+                source.url
+            );
             self.source_mgr.report_failure(&source);
             return SegOutcome::Failed;
         }
 
         // 服务器对 Range 请求返回 200 整文件：字节位置错位，视为失败（引擎会降级处理）
         if self.supports_range && status == 200 && start > 0 {
+            tracing::warn!(
+                "worker {} Range 请求被回 200 整文件（字节错位）: {}",
+                self.worker_id,
+                source.url
+            );
             self.source_mgr.report_failure(&source);
             return SegOutcome::Failed;
         }
@@ -363,7 +378,7 @@ impl DownloadWorker {
             let msg = match tokio::time::timeout(timeout, rx.recv()).await {
                 Ok(v) => v,
                 Err(_) => {
-                    tracing::debug!("worker {} 读流超时", self.worker_id);
+                    tracing::warn!("worker {} 读流超时", self.worker_id);
                     flush_early(&mut buf);
                     self.source_mgr.report_failure(&source);
                     return SegOutcome::Failed;
@@ -382,7 +397,7 @@ impl DownloadWorker {
                         }
                         return SegOutcome::Cancelled;
                     }
-                    tracing::debug!(
+                    tracing::warn!(
                         "worker {} 读流错误: {}",
                         self.worker_id,
                         curl_error_text(&e)
@@ -392,6 +407,10 @@ impl DownloadWorker {
                     return SegOutcome::Failed;
                 }
                 None => {
+                    tracing::warn!(
+                        "worker {} 下载通道关闭（curl 线程提前结束）",
+                        self.worker_id
+                    );
                     flush_early(&mut buf);
                     self.source_mgr.report_failure(&source);
                     return SegOutcome::Failed;

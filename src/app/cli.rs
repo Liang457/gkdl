@@ -29,35 +29,23 @@ pub enum Command {
     Remove(GidArgs),
 }
 
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args, Debug, Default)]
 pub struct DaemonArgs {
     /// 配置文件路径
     #[arg(short, long)]
     pub config: Option<std::path::PathBuf>,
-    /// RPC 监听地址
-    #[arg(long, default_value = "127.0.0.1")]
-    pub host: String,
-    /// RPC 端口
-    #[arg(long, default_value_t = 6800)]
-    pub port: u16,
+    /// RPC 监听地址（不传则用配置文件，再退回默认值）
+    #[arg(long)]
+    pub host: Option<String>,
+    /// RPC 端口（不传则用配置文件，再退回默认值）
+    #[arg(long)]
+    pub port: Option<u16>,
     /// RPC 密钥（token）
     #[arg(long)]
     pub rpc_secret: Option<String>,
     /// 不显示托盘图标
     #[arg(long)]
     pub no_tray: bool,
-}
-
-impl Default for DaemonArgs {
-    fn default() -> Self {
-        Self {
-            config: None,
-            host: "127.0.0.1".into(),
-            port: 6800,
-            rpc_secret: None,
-            no_tray: false,
-        }
-    }
 }
 
 #[derive(clap::Args, Debug)]

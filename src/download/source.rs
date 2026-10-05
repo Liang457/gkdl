@@ -59,7 +59,10 @@ impl SourceManager {
     pub fn report_failure(&self, source: &Source) {
         let count = source.fail_count.fetch_add(1, Ordering::Relaxed) + 1;
         if count >= source.max_fails {
-            source.is_failed.store(true, Ordering::Relaxed);
+            // 仅在「未禁用 → 禁用」的瞬间记一次，避免后续失败重复刷日志
+            if !source.is_failed.swap(true, Ordering::Relaxed) {
+                tracing::warn!("下载源 {} 连续失败 {} 次，已禁用", source.url, count);
+            }
         }
     }
 

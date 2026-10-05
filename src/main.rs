@@ -21,8 +21,10 @@ fn main() {
     attach_parent_console();
 
     let cli = Cli::parse();
-    // daemon 模式由 logging::init_logging 接管；其它命令用默认 stdout 日志
-    if !matches!(cli.command, Some(Command::Daemon(_))) {
+    // daemon 模式由 logging::init_logging 接管；其它命令用默认 stdout 日志。
+    // 注意：无子命令（双击直接运行）也走 daemon，此处不得预装 subscriber，
+    // 否则 init_logging 的 try_init 会因全局 subscriber 已存在而失败，文件日志失效。
+    if !matches!(cli.command, Some(Command::Daemon(_)) | None) {
         tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_default_env()
@@ -237,10 +239,14 @@ async fn run_daemon(args: DaemonArgs) -> i32 {
         }
     };
 
-    // CLI 参数优先于配置文件
+    // CLI 参数优先于配置文件：仅在显式传入时覆盖，否则沿用 config.yaml（defaults < file < CLI）
     let mut daemon_cfg = file_cfg.daemon.clone();
-    daemon_cfg.host = args.host.clone();
-    daemon_cfg.port = args.port;
+    if let Some(h) = &args.host {
+        daemon_cfg.host = h.clone();
+    }
+    if let Some(p) = args.port {
+        daemon_cfg.port = p;
+    }
     daemon_cfg.no_tray = daemon_cfg.no_tray || args.no_tray;
     if let Some(sec) = &args.rpc_secret {
         daemon_cfg.rpc_secret = sec.clone();
@@ -251,8 +257,10 @@ async fn run_daemon(args: DaemonArgs) -> i32 {
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-    // 初始化日志（daemon 模式）
-    let _ = logging::init_logging(&config_dir, &file_cfg.log);
+    // 初始化日志（daemon 模式）；失败必须可见，不能静默吞掉
+    if let Err(e) = logging::init_logging(&config_dir, &file_cfg.log) {
+        eprintln!("日志初始化失败: {e:#}");
+    }
 
     // 打开状态数据库（SQLite，替换下载目录下的 .gkdl 控制文件）
     let state_db_path = {

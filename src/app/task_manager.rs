@@ -560,6 +560,11 @@ impl TaskManager {
     }
 
     async fn finish_error(self: &Arc<Self>, task: &Arc<Task>, err: anyhow::Error) {
+        // 用户取消/移除不是异常：引擎收尾时会以取消错误结束，此处不记失败、不发错误事件
+        if task.status() == TaskStatus::Removed || task.task_token.is_cancelled() {
+            tracing::debug!("任务 {} 已被用户取消，忽略引擎错误: {err:#}", task.gid);
+            return;
+        }
         let msg = format!("{err:#}");
         tracing::error!("任务 {} 失败: {}", task.gid, msg);
         *task.error_message.lock().unwrap() = Some(msg.clone());
@@ -626,6 +631,7 @@ impl TaskManager {
                 let _ = self.events.send(TaskEvent::Paused {
                     gid: gid.to_string(),
                 });
+                tracing::info!("任务 {} 已暂停", gid);
                 Ok(())
             }
             None => {
@@ -635,6 +641,7 @@ impl TaskManager {
                     let _ = self.events.send(TaskEvent::Paused {
                         gid: gid.to_string(),
                     });
+                    tracing::info!("任务 {} 已暂停（排队中）", gid);
                     Ok(())
                 } else {
                     bail!("任务尚未启动")
@@ -690,6 +697,7 @@ impl TaskManager {
             s.set_paused(false); // 唤醒被暂停阻塞的 worker
         }
         *task.status.lock().unwrap() = TaskStatus::Removed;
+        tracing::info!("任务 {} 已移除", gid);
         let _ = self.events.send(TaskEvent::Stopped {
             gid: gid.to_string(),
         });

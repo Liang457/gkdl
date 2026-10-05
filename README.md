@@ -50,6 +50,8 @@ gkdl daemon [--config <path>] [--port 6800] [--rpc-secret <secret>] [--no-tray]
 # 首次运行自动生成 %APPDATA%\gkdl\config.yaml
 ```
 
+`--host`/`--port`/`--rpc-secret` 未显式传入时使用配置文件中的 `daemon.*` 值。
+
 不带子命令直接运行也进入 daemon 模式。配合 AriaNg：
 
 ```

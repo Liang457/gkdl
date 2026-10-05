@@ -14,3 +14,4 @@ logs/
 
 # opencode 自定义命令
 .opencode/
+.zcode/
