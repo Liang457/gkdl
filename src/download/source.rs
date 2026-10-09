@@ -82,6 +82,7 @@ impl SourceManager {
         }
     }
 
+    /// 全部源是否已禁用（仅供单元测试断言使用）。
     #[allow(dead_code)]
     pub fn all_failed(&self) -> bool {
         self.sources

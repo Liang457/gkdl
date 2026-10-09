@@ -30,15 +30,11 @@ pub struct DownloadReport {
     pub elapsed: Duration,
 }
 
-/// 后台下载句柄：pause/resume/cancel/join。
-#[allow(dead_code)]
+/// 后台下载句柄：cancel/join。
 pub struct DownloadHandle {
     scheduler: Arc<WorkStealingScheduler>,
-    limiter: TokenBucket,
     cancel_token: CancellationToken,
     join: tokio::task::JoinHandle<Result<DownloadReport>>,
-    pub path: PathBuf,
-    pub total: u64,
 }
 
 impl DownloadHandle {
@@ -46,52 +42,10 @@ impl DownloadHandle {
         Arc::clone(&self.scheduler)
     }
 
-    #[allow(dead_code)]
-    pub fn limiter_ref(&self) -> TokenBucket {
-        self.limiter.clone()
-    }
-
-    pub fn cancel_token_ref(&self) -> CancellationToken {
-        self.cancel_token.clone()
-    }
-
-    #[allow(dead_code)]
-    pub fn pause(&self) {
-        self.scheduler.set_paused(true);
-    }
-
-    #[allow(dead_code)]
-    pub fn resume(&self) {
-        self.scheduler.set_paused(false);
-    }
-
-    #[allow(dead_code)]
-    pub fn is_paused(&self) -> bool {
-        self.scheduler.is_paused()
-    }
-
-    /// 优雅取消：worker 在当前块结束后停止，控制文件保留以便续传。
-    #[allow(dead_code)]
+    /// 优雅取消：worker 在当前块结束后停止，已下字节与状态库记录保留以便续传。
     pub fn cancel(&self) {
         self.cancel_token.cancel();
         self.scheduler.set_paused(false); // 唤醒被暂停阻塞的 worker
-    }
-
-    /// 强制终止后台任务。
-    #[allow(dead_code)]
-    pub fn abort(&self) {
-        self.join.abort();
-    }
-
-    #[allow(dead_code)]
-    pub async fn progress(&self) -> Progress {
-        let completed = self.scheduler.completed_bytes().await;
-        Progress {
-            total: self.total,
-            completed,
-            speed: 0.0,
-            connections: self.scheduler.active_connections().await,
-        }
     }
 
     pub async fn join(self) -> Result<DownloadReport> {
@@ -120,11 +74,12 @@ pub fn should_use_streaming(probe: &ProbeInfo, config: &DownloadConfig) -> bool 
 
 /// 从 URL 提取文件名（百分号解码 + 路径分隔符清洗）。
 pub fn filename_from_url(url: &str) -> String {
-    let path = url.split(['?', '#']).next().unwrap_or(url);
+    // split/rsplit 至少产出一项，next() 不可能为 None
+    let path = url.split(['?', '#']).next().unwrap();
     if path.ends_with('/') {
         return "download.bin".to_string();
     }
-    let name = path.rsplit('/').next().unwrap_or("").to_string();
+    let name = path.rsplit('/').next().unwrap().to_string();
     if name.is_empty() {
         return "download.bin".to_string();
     }
@@ -211,7 +166,7 @@ fn make_record(
     }
 }
 
-/// 探测并启动后台下载。返回句柄后可 pause/resume/cancel/join。
+/// 探测并启动后台下载。返回句柄供取消（`cancel`）与等待完成（`join`）。
 /// `cancel_token` 同时用于探测阶段与下载阶段；探测期间取消会立即中止。
 /// `limiter` 提供共享限速器（None 则按 config.rate_limit 新建）。
 /// `db` 为状态数据库（None 则不持久化、无法跨进程续传）；`gid` 为任务标识
@@ -245,7 +200,7 @@ pub async fn start_download(
         if cancel_token.is_cancelled() {
             bail!("下载已取消");
         }
-        match client.probe(url, &cancel_token, config.timeout).await {
+        match client.probe(url, &cancel_token).await {
             Ok((info, warm)) => {
                 probe_info = Some(info);
                 warm_conn = warm.map(|e| (url.clone(), e));
@@ -263,7 +218,7 @@ pub async fn start_download(
         config.split = 1;
     }
     // 流式（压缩）路径：允许压缩且该下载无法/无需分段。
-    // 探测拿不到大小且不允许流式 → 保持原有的「无法获取文件大小」错误语义。
+    // 不允许压缩且拿不到大小 → 直接报「无法获取文件大小」。
     let streaming = should_use_streaming(&probe, &config);
     if !probe.total_known && !config.allow_compression {
         bail!("无法获取文件大小");
@@ -425,11 +380,10 @@ pub async fn start_download(
     for u in &failed_urls {
         source_mgr.disable(u);
     }
-    let limiter = match limiter {
+    let limiter_task = match limiter {
         Some(l) => l,
         None => TokenBucket::new(config.rate_limit),
     };
-    let limiter_task = limiter.clone();
 
     let total = probe.total;
     let supports_range = probe.supports_range;
@@ -536,11 +490,11 @@ pub async fn start_download(
                 handles.push(tokio::spawn(async move { worker.run().await }));
             }
 
-            // 汇总 worker 结果；无论成败都先中止 monitor，防止 worker 协程异常时
-            // 监控协程继续泄漏运行（持有一组 Arc 引用与进度回调，永不结束）。
+            // 汇总 worker 结果；无论成败都先中止 monitor，防止 worker 任务异常时
+            // 监控任务继续泄漏运行（持有一组 Arc 引用与进度回调，永不结束）。
             let workers_result: Result<()> = (async {
                 for h in handles {
-                    h.await.context("worker 协程异常退出")?;
+                    h.await.context("worker 任务异常退出")?;
                 }
                 Ok(())
             })
@@ -574,7 +528,6 @@ pub async fn start_download(
             }
             drop(writer_task); // 释放文件句柄，便于读取校验
 
-            // SHA-256 校验
             if let Some(expected) = &sha256_task {
                 tracing::info!("正在校验 SHA-256...");
                 crate::app::hash::verify_sha256(&path_task, expected)?;
@@ -624,15 +577,12 @@ pub async fn start_download(
 
     Ok(DownloadHandle {
         scheduler,
-        limiter,
         cancel_token,
         join,
-        path,
-        total,
     })
 }
 
-/// 阻塞式下载（CLI 用）。
+/// 阻塞式下载入口（生产路径走 `TaskManager`，当前仅供 tests/ 集成测试使用）。
 #[allow(dead_code)]
 pub async fn download(
     urls: Vec<String>,
@@ -698,7 +648,7 @@ mod tests {
             supports_range: false,
         };
         assert!(should_use_streaming(&probe, &cfg_with_compression(true)));
-        // 不允许压缩时回退到原有单流降级
+        // 不允许压缩：不流式
         assert!(!should_use_streaming(&probe, &cfg_with_compression(false)));
     }
 
@@ -721,7 +671,7 @@ mod tests {
             supports_range: true,
         };
         assert!(should_use_streaming(&probe, &cfg_with_compression(true)));
-        // 边界：恰好 2 倍最小分片 → 仍可分段，不流式
+        // 边界：恰好 2 倍最小段长 → 仍可分段，不流式
         let probe2 = ProbeInfo {
             total: 512 * 1024,
             total_known: true,

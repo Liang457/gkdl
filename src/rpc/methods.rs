@@ -271,24 +271,15 @@ async fn list_tasks_status(tasks: impl Iterator<Item = Arc<Task>>) -> Value {
     Value::Array(arr)
 }
 
-/// aria2.getVersion 对外声明的静态启用特性（统一开关）。
-///
-/// 已实现并声明：
+/// aria2.getVersion 对外声明的静态启用特性，只声明已实现的能力：
 /// - `Threaded DNS`：curl 线程化异步 DNS
-/// - `Message Digest`：SHA-256 校验（src/app/hash.rs）
+/// - `Message Digest`：SHA-256 校验
 /// - `XML-RPC`：JSON-RPC over HTTP/WebSocket
 ///
-/// 说明：分段下载强制 `Accept-Encoding: identity`（要原始字节），不启用 GZip 解压；
-/// HTTP/3（h3）libcurl 静态版未集成（此前实现亦不支持），无回归。
-///
-/// 尚未实现、故不声明（若日后实现，把对应字符串加进此数组即可对外启用）：
-/// - `BitTorrent`（含 magnet、tracker、DHT 等）
-/// - `Metalink`
-/// - `Firefox3 Cookie`
-///
-/// 运行时还会在此列表之后追加 libcurl/TLS/zlib/nghttp2 的库版本条目（见
-/// [`enabled_features`]），AriaNg 会把数组逐项原样渲染到"已启用功能"。其中
-/// `TLS: <后端>`、`nghttp2 <版本>` 取代了静态 `HTTPS` / `HTTP/2`（避免重叠）。
+/// 未实现的 `BitTorrent`/`Metalink`/`Firefox3 Cookie` 不声明（实现后加入此处即对外启用）；
+/// 分段下载强制 identity 编码，不声明 GZip；`HTTPS`/`HTTP/2` 由 [`enabled_features`]
+/// 的运行时条目（`TLS: <后端>`、`nghttp2 <版本>`）取代，避免重叠。AriaNg 会把
+/// 数组逐项渲染到「已启用功能」。
 pub const ENABLED_FEATURES: &[&str] = &["Threaded DNS", "Message Digest", "XML-RPC"];
 
 /// nghttp2 版本号编码为 `major<<16 | minor<<8 | patch`，拆成 `x.y.z` 可读形式。
@@ -605,15 +596,12 @@ async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> R
                 }
             }
 
-            let out_path = if out_path.is_some() {
-                out_path
-            } else {
-                Some(dir.join(crate::download::engine::filename_from_url(&uris[0])))
-            };
+            let out_path = out_path
+                .unwrap_or_else(|| dir.join(crate::download::engine::filename_from_url(&uris[0])));
 
             let gid = ctx
                 .mgr
-                .add_download(uris, out_path, config, None)
+                .add_download(uris, Some(out_path), config, None)
                 .await
                 .map_err(|e| err(1, format!("{e:#}")))?;
             Ok(json!(gid))
@@ -786,7 +774,7 @@ async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> R
         }
 
         "aria2.saveSession" => {
-            // 本实现控制文件即会话，任务进行中即持久化
+            // 状态库即会话：任务进行中已持续持久化，无需额外动作
             Ok(json!("OK"))
         }
 
@@ -939,13 +927,13 @@ mod tests {
 
     #[test]
     fn enabled_features_are_honest() {
-        // 只声明已实现的能力；未实现的 BitTorrent/Metalink 等不得对外声称
+        // 守护：只声明已实现的能力，未实现的 BitTorrent/Metalink 等不得对外声称
         for f in ENABLED_FEATURES {
             assert!(!matches!(*f, "BitTorrent" | "Metalink" | "Firefox3 Cookie"));
         }
         assert!(ENABLED_FEATURES.contains(&"Threaded DNS"));
         assert!(ENABLED_FEATURES.contains(&"Message Digest"));
-        // TLS / HTTP/2 不再作为静态条目，改由运行时 TLS: / nghttp2 版本条目取代
+        // HTTPS / HTTP/2 由运行时 TLS: / nghttp2 版本条目取代，不作静态条目
         assert!(!ENABLED_FEATURES.contains(&"HTTPS"));
         assert!(!ENABLED_FEATURES.contains(&"HTTP/2"));
     }
@@ -964,7 +952,7 @@ mod tests {
         assert!(f
             .iter()
             .any(|s| s == &format!("libcurl {}", curl::Version::get().version())));
-        // 静态特性名不再重复声明 HTTPS / HTTP/2（已由 TLS / nghttp2 版本条目取代）
+        // HTTPS / HTTP/2 由 TLS / nghttp2 版本条目取代，静态列表不声明
         assert!(!f.iter().any(|s| s == "HTTPS"));
         assert!(!f.iter().any(|s| s == "HTTP/2"));
     }
@@ -1033,7 +1021,6 @@ mod tests {
             retries: 0,
             speed_history: std::collections::VecDeque::new(),
             speed_window: 20,
-            last_sample_at: None,
             tick_bytes: 0,
         }];
         let (n, bf) = piece_bitfield(&segs, 4 * 1024 * 1024, 1024 * 1024);
@@ -1055,7 +1042,6 @@ mod tests {
             retries: 0,
             speed_history: std::collections::VecDeque::new(),
             speed_window: 20,
-            last_sample_at: None,
             tick_bytes: 0,
         };
         // 仅第一段完成：piece0 只覆盖一半 → 位 0 不应置位
@@ -1083,7 +1069,6 @@ mod tests {
             retries: 0,
             speed_history: std::collections::VecDeque::new(),
             speed_window: 20,
-            last_sample_at: None,
             tick_bytes: 0,
         };
         let (n, bf) = piece_bitfield(&[seg], 4 * 1024 * 1024, 1024 * 1024);
@@ -1101,7 +1086,6 @@ mod tests {
             retries: 0,
             speed_history: std::collections::VecDeque::new(),
             speed_window: 20,
-            last_sample_at: None,
             tick_bytes: 0,
         };
         let segs = vec![
@@ -1135,7 +1119,6 @@ mod tests {
             retries: 0,
             speed_history: std::collections::VecDeque::new(),
             speed_window: 20,
-            last_sample_at: None,
             tick_bytes: 0,
         };
         let (_, bf) = piece_bitfield(&[seg], 4 * 1024 * 1024, 1024 * 1024);

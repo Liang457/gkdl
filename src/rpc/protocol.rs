@@ -2,11 +2,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// JSON-RPC 2.0 请求（aria2 风格：params 数组，可省略）。
+/// 请求中的 `jsonrpc` 字段无需解析：serde 默认忽略未知字段，响应侧固定写 "2.0"。
 #[derive(Debug, Deserialize)]
 pub struct RpcRequest {
-    #[allow(dead_code)]
-    #[serde(rename = "jsonrpc")]
-    pub jsonrpc: Option<String>,
     pub id: Option<Value>,
     pub method: String,
     #[serde(default)]

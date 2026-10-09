@@ -20,8 +20,6 @@ pub struct Segment {
     pub retries: u32,
     pub speed_history: VecDeque<f64>,
     pub speed_window: usize,
-    /// 上一次采样的时间点
-    pub last_sample_at: Option<std::time::Instant>,
     /// 上个采样周期内的字节数
     pub tick_bytes: u64,
 }
@@ -38,7 +36,6 @@ impl Segment {
             retries: 0,
             speed_history: VecDeque::with_capacity(speed_window),
             speed_window,
-            last_sample_at: None,
             tick_bytes: 0,
         }
     }
@@ -56,14 +53,10 @@ impl Segment {
         self.written >= self.end.saturating_sub(self.start)
     }
 
-    #[allow(dead_code)]
-    pub fn len(&self) -> u64 {
+    /// 段的字节区间长度（start..end，与已写字节数无关）。
+    #[allow(dead_code)] // 仅供 tests/ 集成测试断言使用
+    pub fn byte_len(&self) -> u64 {
         self.end.saturating_sub(self.start)
-    }
-
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     pub fn avg_speed(&self) -> f64 {
@@ -94,6 +87,5 @@ impl Segment {
     pub fn clear_speed(&mut self) {
         self.speed_history.clear();
         self.tick_bytes = 0;
-        self.last_sample_at = None;
     }
 }

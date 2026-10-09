@@ -1,3 +1,5 @@
+//! aria2 兼容的 JSON-RPC 层：HTTP POST / GET JSONP / WebSocket 传输与方法分发。
+
 pub mod client;
 pub mod methods;
 pub mod protocol;
@@ -39,6 +41,7 @@ pub struct GlobalOptions {
     pub retries: u32,
     pub timeout: u64,
     pub dir: PathBuf,
+    /// aria2 兼容字段（save-session）：无实际效果，任务状态已由 SQLite 持续持久化。
     pub save_session: bool,
     pub piece_length: u64,
     pub user_agent: String,

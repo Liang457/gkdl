@@ -1,7 +1,8 @@
 //! libcurl HTTP 传输层：基于 curl crate 的 Easy 句柄实现探测与分段下载。
 //!
-//! 所有请求强制 `Accept-Encoding: identity`（分段下载必须拿原始字节，不做解压）；
-//! 探测/下载走 `spawn_blocking`，回调经 tokio 通道传回异步侧（通道满即 TCP 背压）。
+//! 分段/探测强制 `Accept-Encoding: identity`（必须拿原始字节，不做解压），
+//! 整文件流式可用 gzip/deflate（libcurl 自动解压）；请求走 `spawn_blocking`，
+//! 回调经 tokio 通道传回异步侧（通道满即 TCP 背压）。
 
 use crate::download::config::DownloadConfig;
 use anyhow::{anyhow, bail, Result};
@@ -37,7 +38,7 @@ pub enum CurlMsg {
     End(Result<(), curl::Error>, Easy),
 }
 
-/// 基于 libcurl 的 HTTP 客户端（线程安全，可跨协程共享）。
+/// 基于 libcurl 的 HTTP 客户端（线程安全，可跨任务共享）。
 #[derive(Clone)]
 pub struct HttpClient {
     user_agent: String,
@@ -139,8 +140,14 @@ impl HttpClient {
             user_agent: ua,
             referer,
             headers,
-            timeout: config.timeout,
+            // 钳制最少 5s：0 在 curl 里表示禁用超时，请求会永久挂起
+            timeout: config.timeout.max(5),
         })
+    }
+
+    /// 请求超时秒数（构造时已钳制最少 5s）。
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout
     }
 
     /// IDN 主机名转 punycode（中文域名可用）；已是 ASCII/无主机时原样返回。
@@ -229,7 +236,7 @@ impl HttpClient {
         }
         easy.follow_location(true)?;
         easy.max_redirections(10)?;
-        easy.connect_timeout(Duration::from_secs(self.timeout.max(5)))?;
+        easy.connect_timeout(Duration::from_secs(self.timeout))?;
         // HTTPS 走 HTTP/2（ALPN 协商，失败自动回落 1.1）；HTTP 保持 1.1（不尝试 h2c）。
         easy.http_version(HttpVersion::V2TLS)?;
         // 低速兜底：服务器长时间无数据传输（卡死/静默）时，让阻塞线程自行退出。
@@ -237,7 +244,7 @@ impl HttpClient {
         // 阻塞在 recv() 上无期限地占用一个 blocking 线程（泄漏）。语义与 async 侧
         // 「两次 chunk 间隔超时」一致：正常传输有数据流动不会触发。
         easy.low_speed_limit(1)?;
-        easy.low_speed_time(Duration::from_secs(self.timeout.max(5)))?;
+        easy.low_speed_time(Duration::from_secs(self.timeout))?;
         // 清除探测阶段可能设置的整段总超时（0=禁用）
         easy.timeout(Duration::ZERO)?;
         Ok(())
@@ -276,7 +283,6 @@ impl HttpClient {
         tokio::sync::mpsc::Receiver<CurlMsg>,
         tokio::task::JoinHandle<()>,
     )> {
-        // 分段下载必须请求 identity 编码，拿原始字节
         self.stream_impl(url, range, "identity")
     }
 
@@ -396,13 +402,12 @@ impl HttpClient {
         &self,
         url: &str,
         cancel: &CancellationToken,
-        timeout: u64,
     ) -> Result<(ProbeInfo, Option<Easy>)> {
         let this = self.clone();
         let url_owned = url.to_string();
         let (tx, rx) = tokio::sync::oneshot::channel::<(Result<ProbeInfo, String>, Option<Easy>)>();
         let join = tokio::task::spawn_blocking(move || {
-            let result = this.probe_blocking(&url_owned, timeout);
+            let result = this.probe_blocking(&url_owned);
             let _ = tx.send(result);
         });
 
@@ -422,13 +427,13 @@ impl HttpClient {
     /// 阻塞探测实现（在 spawn_blocking 内执行）。返回值第二项为可复用的
     /// Easy 句柄：仅当 206 响应被完整消费（传输干净结束、空闲连接入缓存）
     /// 时才有值；掐断过 body 或请求失败均返回 None。
-    fn probe_blocking(&self, url: &str, timeout: u64) -> (Result<ProbeInfo, String>, Option<Easy>) {
+    fn probe_blocking(&self, url: &str) -> (Result<ProbeInfo, String>, Option<Easy>) {
         let url = Self::normalize_url(url);
         let mut easy = match self.easy(&url, Some((0, 0))) {
             Ok(e) => e,
             Err(e) => return (Err(format!("{e:#}")), None),
         };
-        if let Err(e) = easy.timeout(Duration::from_secs(timeout.max(5))) {
+        if let Err(e) = easy.timeout(Duration::from_secs(self.timeout)) {
             return (Err(curl_error_text(&e)), None);
         }
 
@@ -505,7 +510,7 @@ impl HttpClient {
         } else if status == 200 {
             // 总长兜底：优先 GET 的 Content-Length，缺失时 HEAD；都拿不到则视为大小未知
             // （是否接受未知大小由引擎结合 allow_compression 决定）
-            let head_total = self.head_total_blocking(&url, timeout).ok().flatten();
+            let head_total = self.head_total_blocking(&url).ok().flatten();
             let total = content_length
                 .and_then(|s| s.parse::<u64>().ok())
                 .or(head_total);
@@ -537,10 +542,10 @@ impl HttpClient {
     }
 
     /// HEAD 请求拿 Content-Length（200 无总长的兜底）。
-    fn head_total_blocking(&self, url: &str, timeout: u64) -> Result<Option<u64>, String> {
+    fn head_total_blocking(&self, url: &str) -> Result<Option<u64>, String> {
         let mut easy = self.easy(url, None).map_err(|e| format!("{e:#}"))?;
         easy.nobody(true).map_err(|e| curl_error_text(&e))?; // HEAD
-        easy.timeout(Duration::from_secs(timeout.max(5)))
+        easy.timeout(Duration::from_secs(self.timeout))
             .map_err(|e| curl_error_text(&e))?;
 
         let state = Arc::new(Mutex::new(HeaderState::default()));

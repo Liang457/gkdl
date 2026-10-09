@@ -16,7 +16,7 @@ pub struct SegmentRecord {
     pub complete: bool,
 }
 
-/// 下载任务记录（对应原 `<文件名>.gkdl` 控制文件的内容）。
+/// 下载任务记录（持久化到 SQLite）。
 #[derive(Debug, Clone)]
 pub struct DownloadRecord {
     pub gid: String,
@@ -43,10 +43,10 @@ impl DownloadRecord {
     }
 }
 
-/// 轻量 SQLite 状态库：替换下载目录下的 `.gkdl` 控制文件。
+/// 轻量 SQLite 状态库。
 ///
 /// 单连接 + `std::sync::Mutex` 串行写（WAL 模式下读并发、写串行，够用）。
-/// 所有操作均为快速小事务，调用方（监控协程每秒一次）不会长时间阻塞。
+/// 所有操作均为快速小事务，调用方（监控任务每秒一次）不会长时间阻塞。
 pub struct StateDb {
     conn: Mutex<Connection>,
     pub path: PathBuf,
@@ -114,7 +114,8 @@ impl StateDb {
     }
 
     fn urls_to_json(urls: &[String]) -> String {
-        serde_json::to_string(urls).unwrap_or_default()
+        // Vec<String> 的序列化无失败路径；空串兜底会静默破坏 find_resume 的精确匹配
+        serde_json::to_string(urls).expect("序列化 urls 失败")
     }
 
     fn urls_from_json(s: &str) -> Vec<String> {
@@ -365,7 +366,7 @@ impl StateDb {
     }
 
     /// 清理超过保留期的已结束记录（complete/error）。`retention_days == 0` 表示永久保留。
-    /// 出错记录既不可续传也不会被重新水合，若不清理会永久残留，故一并纳入保留期清理。
+    /// 出错记录既不可续传也不会被恢复，若不清理会永久残留，故一并纳入保留期清理。
     /// 返回被清理的记录数，并在必要时 checkpoint 收缩 WAL。
     pub fn cleanup_completed(&self, retention_days: u32) -> Result<usize> {
         if retention_days == 0 {

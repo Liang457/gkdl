@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
@@ -8,7 +8,7 @@ use tokio::process::Command;
 pub struct HookConfig {
     /// 命令列表文件：每行一条命令，下载完成后逐条执行，下载文件路径作为最后一个参数。
     pub commands_file: Option<PathBuf>,
-    /// 旧式单脚本方式（CLI --post-script 使用）。
+    /// 单脚本方式（CLI --post-script 使用）。
     pub script: Option<PathBuf>,
     pub timeout_sec: u64,
     /// 子进程不弹出命令行窗口（Windows），默认 true。
@@ -79,9 +79,8 @@ fn build_command(program: &str, args: &[String], file_str: &str) -> Command {
         .map(|e| e.eq_ignore_ascii_case("ps1"))
         .unwrap_or(false);
     let mut cmd = if is_ps1 {
-        // 使用 pwsh（PowerShell 7）优先，回退到 powershell；
-        // 不使用 -ExecutionPolicy Bypass（易触发杀软启发式检测），
-        // 用户应通过 Set-ExecutionPolicy 或签名策略管理执行策略。
+        // .ps1 用系统 PowerShell 执行；不用 -ExecutionPolicy Bypass
+        // （易触发杀软启发式检测），执行策略由用户通过 Set-ExecutionPolicy 或签名策略管理。
         let mut c = Command::new("powershell");
         c.arg("-NoProfile")
             .arg("-NonInteractive")
@@ -99,7 +98,7 @@ fn build_command(program: &str, args: &[String], file_str: &str) -> Command {
 async fn spawn_and_wait(mut cmd: Command, timeout_sec: u64, hide_window: bool) -> Result<()> {
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        // 兜底：若本函数所在的 future 被取消（如守护进程退出），杀掉子进程而非任其游离
+        // 兜底：若本函数所在的 future 被取消（如 daemon 退出），杀掉子进程而非任其游离
         .kill_on_drop(true);
 
     #[cfg(windows)]
@@ -110,7 +109,6 @@ async fn spawn_and_wait(mut cmd: Command, timeout_sec: u64, hide_window: bool) -
 
     let mut child = cmd.spawn()?;
 
-    // 逐行转发 stdout / stderr 到日志
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let out_task = stdout.map(|o| {
@@ -132,9 +130,9 @@ async fn spawn_and_wait(mut cmd: Command, timeout_sec: u64, hide_window: bool) -
         })
     });
 
-    // 子进程退出/被终止后管道到达 EOF，转发任务自然结束；统一回收避免孤儿任务持有管道句柄。
-    // 用超时兜底：若子进程派生了继承管道句柄的后代进程导致迟迟不 EOF，也不无限挂起，
-    // 放弃剩余日志立即返回（绝不因 hook 卡死下载驱动协程）。
+    // 子进程退出后管道到 EOF，转发任务自然结束；统一回收防孤儿任务持有管道句柄。
+    // 5s 超时兜底：后代进程继承管道句柄迟迟不 EOF 时，放弃剩余日志立即返回，
+    // 不因 hook 卡住下载流程。
     async fn drain(
         out: Option<tokio::task::JoinHandle<()>>,
         err: Option<tokio::task::JoinHandle<()>>,
@@ -202,14 +200,18 @@ pub async fn run_post_download_commands(commands: &[String], ctx: HookContext<'_
     Ok(())
 }
 
-/// 运行下载后脚本（旧式单脚本方式）：把下载文件路径作为参数传入。
+/// 运行下载后脚本（单脚本方式）：把下载文件路径作为参数传入。
 pub async fn run_post_download_script(script: &Path, ctx: HookContext<'_>) -> Result<()> {
     let script = script.to_path_buf();
     let file_str = ctx.file_path.display().to_string();
 
     tracing::info!("运行下载后脚本: {} \"{}\"", script.display(), file_str);
 
-    let mut cmd = build_command(script.to_str().unwrap_or_default(), &[], &file_str);
+    // 非法 UTF-8 路径显式报错，而非静默变成空程序名后报难以定位的 spawn 失败
+    let script_str = script
+        .to_str()
+        .ok_or_else(|| anyhow!("脚本路径不是有效的 UTF-8: {}", script.display()))?;
+    let mut cmd = build_command(script_str, &[], &file_str);
     apply_env(&mut cmd, &ctx);
     spawn_and_wait(cmd, ctx.timeout, ctx.hide_window).await
 }

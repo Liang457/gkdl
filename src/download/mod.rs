@@ -1,3 +1,5 @@
+//! 下载引擎：源探测、工作窃取调度、多连接分段下载与落盘。
+
 pub mod config;
 pub mod curl;
 pub mod detector;

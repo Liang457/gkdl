@@ -9,7 +9,7 @@ pub struct DownloadConfig {
     /// 初始并发连接数
     #[serde(default = "default_split")]
     pub split: usize,
-    /// 最小碎片字节数
+    /// 最小段长（字节）
     #[serde(default = "default_min_split_size")]
     pub min_split_size: u64,
     /// 内存模式阈值（字节）：文件小于等于该值则不下临时文件、直接在内存累积。
@@ -68,7 +68,7 @@ pub struct DownloadConfig {
     #[serde(default)]
     pub header: Vec<String>,
     /// 是否允许 gzip/deflate 压缩传输。仅对**单连接整文件下载**生效
-    /// （不支持 Range / 无法获取文件大小 / 文件小于最小分片体积×2）；
+    /// （不支持 Range / 无法获取文件大小 / 文件小于最小段长×2）；
     /// 分段下载永远请求 `Accept-Encoding: identity` 拿原始字节。
     /// 流式（压缩）下载由 libcurl 自动解压，暂停/重试即从头重新下载，无法断点续传。
     #[serde(default = "default_allow_compression")]

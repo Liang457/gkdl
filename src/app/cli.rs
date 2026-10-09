@@ -101,7 +101,7 @@ pub struct DownloadArgs {
     #[arg(long)]
     pub sha256: Option<String>,
 
-    /// 最小切片大小（字节）
+    /// 最小段长（字节）
     #[arg(long)]
     pub min_split_size: Option<u64>,
 

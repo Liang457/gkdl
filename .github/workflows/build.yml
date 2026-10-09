@@ -3,6 +3,7 @@ name: Build
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -58,3 +59,35 @@ jobs:
           path: target/release/gkdl.exe
           if-no-files-found: error
           retention-days: 30
+
+  # 推送 v* 标签时把编译产物发布到 GitHub Releases（产物名带版本号，如 gkdl-v0.2.10-windows-x86_64.zip）
+  release:
+    name: 发布 Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 下载构建产物
+        uses: actions/download-artifact@v7
+        with:
+          name: gkdl-windows-x86_64
+          path: artifact
+
+      - name: 打包 zip
+        run: |
+          cd artifact
+          zip "../gkdl-v${GITHUB_REF_NAME#v}-windows-x86_64.zip" gkdl.exe
+
+      - name: 创建 Release 并上传产物
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          zip="gkdl-v${GITHUB_REF_NAME#v}-windows-x86_64.zip"
+          # Release 已存在（如重跑）则只补传产物，避免 create 报错
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$zip" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$zip" --title "$GITHUB_REF_NAME" --generate-notes
+          fi

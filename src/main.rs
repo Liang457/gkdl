@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+//! GKDL 可执行入口：CLI 子命令与 aria2 兼容 daemon（含 Windows 托盘）。
+
 use clap::Parser;
 use gkdl::app::cli::{Cli, Command, DaemonArgs};
 use gkdl::app::config::{self, ConfigStore, LogConfig};
@@ -21,9 +23,8 @@ fn main() {
     attach_parent_console();
 
     let cli = Cli::parse();
-    // daemon 模式由 logging::init_logging 接管；其它命令用默认 stdout 日志。
-    // 注意：无子命令（双击直接运行）也走 daemon，此处不得预装 subscriber，
-    // 否则 init_logging 的 try_init 会因全局 subscriber 已存在而失败，文件日志失效。
+    // daemon 模式（含无子命令的双击启动）由 logging::init_logging 安装 subscriber；
+    // 这里只给其它 CLI 子命令装默认 stdout 日志，避免重复安装使 try_init 失败。
     if !matches!(cli.command, Some(Command::Daemon(_)) | None) {
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -159,7 +160,7 @@ async fn run_download(args: gkdl::app::cli::DownloadArgs) -> i32 {
         script: args.post_script.clone(),
         ..Default::default()
     };
-    // CLI 直连模式同样走状态库（无 .gkdl 控制文件），可跨次续传；打不开则降级为无持久化
+    // CLI 直连模式同样走状态库，可跨次续传；打不开则降级为无持久化
     let state_db = config::default_config_path()
         .parent()
         .map(|p| p.join("state.db"))
@@ -262,7 +263,7 @@ async fn run_daemon(args: DaemonArgs) -> i32 {
         eprintln!("日志初始化失败: {e:#}");
     }
 
-    // 打开状态数据库（SQLite，替换下载目录下的 .gkdl 控制文件）
+    // 打开状态数据库（SQLite）
     let state_db_path = {
         let p = std::path::PathBuf::from(file_cfg.state.db_path.trim());
         if p.is_absolute() {

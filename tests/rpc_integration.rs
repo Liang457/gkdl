@@ -1,3 +1,6 @@
+//! aria2 兼容 RPC 集成测试：方法分发、鉴权、aria2 兼容性约定（缺 params、
+//! multicall 内嵌 token、错误码）、事件通知与任务生命周期（暂停/恢复/移除/并发门控）。
+
 mod common;
 
 use common::TestServer;
@@ -645,7 +648,6 @@ async fn cancel_during_probe_cleans_up_and_does_not_reactivate() {
     );
 
     // 等慢探测本应完成的时刻之后：任务不得被重新激活，也不得产生任何文件
-    // （修复前 driver 会在探测完成后重新置 Active 并下载整文件）
     tokio::time::sleep(std::time::Duration::from_millis(2800)).await;
     assert!(mgr.get(&gid).is_none(), "被移除的任务不应重新激活");
     assert!(!out.exists(), "不应创建部分文件");
@@ -663,7 +665,8 @@ async fn cancel_during_probe_cleans_up_and_does_not_reactivate() {
 #[tokio::test]
 async fn force_remove_with_slow_rate_limit_stops_engine_promptly() {
     // 极低限速（102 B/s）下取消任务：引擎应立即退出并清理状态库记录。
-    // 修复前 worker 卡死在 consume() 的 sleep 中（需 ~642s 才攒够一个分块），清理迟迟不发生。
+    // 守护：取消必须能打断 consume() 的限速等待——否则 worker 要等攒够一个
+    // 分块（~642s）才退出，清理迟迟不发生。
     let data: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
     let server = TestServer::start(data, false).await;
     let out = out_path("slow_cancel_it");
@@ -703,9 +706,9 @@ async fn force_remove_with_slow_rate_limit_stops_engine_promptly() {
 
 #[tokio::test]
 async fn removed_task_late_cleanup_does_not_delete_newer_download() {
-    // 回归场景：A 源（探测成功但下载请求挂起）下载中途 forceRemove，清理被推迟到
-    // driver（引擎仍卡在挂起的连接上）；随后用 B 源下载同一路径并成功完成。
-    // 修复前 A 的迟到清理会按自身 total/completed 判定未完成而误删 B 已完成的文件。
+    // 场景：A 源（探测成功但下载请求挂起）下载中途 forceRemove，清理被推迟到
+    // driver（引擎仍卡在挂起的连接上）；随后用 B 源下载同一路径并完成。
+    // 守护：A 的迟到清理不得按自身 total/completed 判定未完成而误删 B 已完成的文件。
     let data: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
     let server = TestServer::start(data.clone(), false).await;
     let hang_url = format!("http://{}/hang_download", server.addr);
@@ -806,7 +809,7 @@ async fn tell_status_reports_piece_info() {
 
 #[tokio::test]
 async fn tell_status_bitfield_grows_mid_download() {
-    // 8 MiB 文件、单线程限速下载：下载过程中位图应逐步体现已完成区块（复现活跃任务位图全 0 的问题）
+    // 8 MiB 文件、单线程限速下载：守护活跃任务的位图应逐步体现已完成区块（不得恒为全 0）
     let data: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
     let server = TestServer::start(data, false).await;
     let out = out_path("bitfield_grows_it");
@@ -1051,12 +1054,13 @@ async fn max_concurrent_downloads_limits_concurrency() {
     let _ = std::fs::remove_file(format!("{}.gkdl", out2.display()));
 }
 
-/// 回归测试：排队中被暂停的任务被删除后，driver 应立即退出而非永久挂起。
-/// 之前 remove() 不通知 resume_notify，driver 卡在 notified().await 泄漏 Arc<Task>。
+/// 排队中被暂停的任务被删除后，driver 应立即退出而非永久挂起。
+/// 守护：remove() 必须通知 resume_notify，否则 driver 卡在 notified().await
+/// 泄漏 Arc<Task>，is_finished() 永远为 false。
 ///
 /// 时序：gid1 慢下载占住槽位 → gid2 进入 waiting → pause(gid2) 使其 Paused。
 /// gid1 完成后 gid2 抢到槽位但发现已暂停，于是 driver 阻塞在 resume_notify 等待；
-/// 此时 remove(gid2) 必须能唤醒 driver 使其退出（否则 is_finished() 永远为 false）。
+/// 此时 remove(gid2) 必须能唤醒 driver 使其退出。
 #[tokio::test]
 async fn removing_paused_queued_task_does_not_hang_driver() {
     let data: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();

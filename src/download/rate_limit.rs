@@ -29,14 +29,8 @@ impl TokenBucket {
         }
     }
 
-    #[allow(dead_code)]
     pub fn set_rate(&self, rate: u64) {
         self.inner.rate.store(rate, Ordering::Relaxed);
-    }
-
-    #[allow(dead_code)]
-    pub fn rate(&self) -> u64 {
-        self.inner.rate.load(Ordering::Relaxed)
     }
 
     fn refill(&self, now: Instant) {
@@ -44,9 +38,6 @@ impl TokenBucket {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        if now < *last {
-            return;
-        }
         let elapsed = now.duration_since(*last).as_secs_f64();
         if elapsed <= 0.0 {
             return;

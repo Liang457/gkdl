@@ -3,18 +3,12 @@ use anyhow::{bail, Context, Result};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 
-/// 预分配 + 偏移写盘（pwrite）。
-///
-/// 各 worker 只写自己的非重叠区间，因此 `write_at` 并发安全：
-/// Windows 用 overlapped `seek_write`（显式偏移，不共享文件指针），
-/// Unix 用等价的 `write_at`。
-///
-/// 与旧版整文件 mmap 相比，pwrite 的页面归属系统页缓存而非进程工作集，
-/// 大文件下载时进程工作集不再随文件大小虚高。
+/// 预分配 + 偏移写盘。各 worker 只写自己的非重叠区间，`write_at` 并发安全：
+/// Windows 用 overlapped `seek_write`（显式偏移，不共享文件指针），Unix 用等价的 `write_at`。
+/// 写入的页面归属系统页缓存，进程工作集不随文件大小增长。
 pub struct PwriteWriter {
     file: File,
     total: u64,
-    path: std::path::PathBuf,
 }
 
 impl PwriteWriter {
@@ -39,21 +33,7 @@ impl PwriteWriter {
 
         file.set_len(total).with_context(|| "预分配文件失败")?;
 
-        Ok(Self {
-            file,
-            total,
-            path: path.to_path_buf(),
-        })
-    }
-
-    #[allow(dead_code)]
-    pub fn total(&self) -> u64 {
-        self.total
-    }
-
-    #[allow(dead_code)]
-    pub fn path(&self) -> &Path {
-        &self.path
+        Ok(Self { file, total })
     }
 
     /// 把数据写入 offset 处。调用方必须保证区间不与其它并发写重叠。
@@ -182,7 +162,7 @@ mod tests {
 
     #[test]
     fn concurrent_disjoint_writes_match_pwrite_contract() {
-        // 模拟两个 worker 写互不重叠区间（等价于 mmap 的前置条件）
+        // 模拟两个 worker 写互不重叠区间（write_at 并发安全的前提）
         let p = tmp_path();
         let w = std::sync::Arc::new(PwriteWriter::new(&p, 1024).unwrap());
         let mut handles = Vec::new();

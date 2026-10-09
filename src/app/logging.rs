@@ -305,7 +305,6 @@ fn archive_old_logs(config_dir: &Path, log_cfg: &LogConfig, log_path: &Path) -> 
         }
     }
 
-    // 保留清理
     cleanup_archive(&archive_dir, log_cfg.retention_days);
     Ok(())
 }

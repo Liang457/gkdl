@@ -6,7 +6,7 @@ use std::sync::Mutex;
 /// 写盘抽象：`PwriteWriter`（预分配 + 偏移写）、`MemoryWriter`（小文件内存模式）、
 /// `StreamingWriter`（未知大小整文件顺序流）共用。
 ///
-/// 并发模型与旧版一致：各 worker 只写自己的非重叠区间，因此 `write_at` 无需同步。
+/// 并发模型：各 worker 只写自己的非重叠区间，`write_at` 无需同步。
 pub trait DownloadWriter: Send + Sync {
     /// 把数据写入 offset 处。调用方必须保证区间不与其它并发写重叠。
     fn write_at(&self, offset: u64, data: &[u8]) -> Result<()>;
@@ -26,8 +26,8 @@ pub trait DownloadWriter: Send + Sync {
 
 /// 小文件内存模式写器：数据累积在 RAM，下载完成后一次性原子落盘。
 ///
-/// `write_at` 通过裸指针写入 `UnsafeCell<Vec<u8>>`，前置条件与 mmap 相同：
-/// 并发写必须落在互不重叠的区间（由 scheduler 保证）。
+/// `write_at` 通过裸指针写入 `UnsafeCell<Vec<u8>>`，并发写必须落在
+/// 互不重叠的区间（由 scheduler 保证）。
 pub struct MemoryWriter {
     inner: std::cell::UnsafeCell<Vec<u8>>,
     total: u64,
@@ -38,7 +38,7 @@ pub struct MemoryWriter {
 unsafe impl Sync for MemoryWriter {}
 
 impl MemoryWriter {
-    /// 分配 `total` 字节的零初始化缓冲（占位语义与 mmap 预分配一致）。
+    /// 分配 `total` 字节的零初始化缓冲（等价于磁盘模式的文件预分配）。
     pub fn new(total: u64) -> Self {
         let buf = vec![0u8; total as usize];
         Self {
@@ -51,6 +51,7 @@ impl MemoryWriter {
         unsafe { (*self.inner.get()).as_mut_ptr() }
     }
 
+    /// 只读访问整个缓冲（仅供单元测试断言使用）。
     #[allow(dead_code)]
     pub fn as_slice(&self) -> &[u8] {
         unsafe { &*self.inner.get() }
@@ -267,8 +268,8 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_disjoint_writes_match_mmap_contract() {
-        // 模拟两个 worker 写互不重叠区间（等价于 mmap 的前置条件）
+    fn concurrent_disjoint_writes_match_contract() {
+        // 模拟两个 worker 写互不重叠区间（并发安全的前提）
         let w = std::sync::Arc::new(MemoryWriter::new(1024));
         let mut handles = Vec::new();
         for (lo, hi, byte) in [(0u64, 512u64, 1u8), (512, 1024, 2)] {

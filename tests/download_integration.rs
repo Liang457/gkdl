@@ -94,7 +94,7 @@ async fn multi_thread_range_download_matches() {
     let mut ranges = segment_ranges(&log, "/file.bin");
     assert!(
         ranges.len() >= 4,
-        "应有至少 4 个段请求（含窃取碎片），实际 {ranges:?}"
+        "应有至少 4 个段请求（含窃取的段），实际 {ranges:?}"
     );
     ranges.sort();
     assert_eq!(ranges[0].0, 0, "第一个段应从 0 开始: {ranges:?}");
@@ -624,8 +624,8 @@ async fn http_500_fails_fast_without_cooldown() {
 
 /// 反爬核心行为：跨段连接复用。错峰延迟（第 N 条连接首字节延迟 N×400ms）
 /// 制造确定性的工作窃取：先完成的 worker 在同一条连接上顺序处理多个段。
-/// keep-alive 下请求数必须严格多于连接数——若回归成「每段新建连接」
-/// （正是触发远端 WAF 的爬虫特征），此测试失败。
+/// 守护：keep-alive 下请求数必须严格多于连接数——每段新建连接是
+/// 触发远端 WAF 的爬虫特征。
 #[tokio::test]
 async fn connection_reuse_serves_many_requests_over_few_connections() {
     let data = make_data(2 * 1024 * 1024);

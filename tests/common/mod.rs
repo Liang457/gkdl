@@ -35,8 +35,6 @@ pub struct ReqRecord {
     pub path: String,
     /// 请求的 Range 区间（含端点）；无 Range 头为 None。
     pub range: Option<(u64, u64)>,
-    /// 请求到达时刻。
-    pub at: Instant,
 }
 
 struct Opts {
@@ -102,12 +100,8 @@ impl TestServer {
     }
 
     /// 启动服务器，`/block` 路径：探测（Range 0-0）正常 206，
-    /// 其余请求先拒绝 `block_first` 次（403）再恢复正常（模拟远端限流/反爬）。
-    pub async fn start_block(data: Vec<u8>, block_first: usize) -> Self {
-        Self::start_block_status(data, block_first, 403).await
-    }
-
-    /// 同 `start_block`，但可指定拒绝状态码（403/429 触发冷却，500 不触发）。
+    /// 其余请求先拒绝 `block_first` 次再恢复正常（模拟远端限流/反爬）。
+    /// `status` 指定拒绝状态码（403/429 触发冷却，500 不触发）。
     pub async fn start_block_status(data: Vec<u8>, block_first: usize, status: u16) -> Self {
         Self::start_inner(
             data,
@@ -167,7 +161,7 @@ impl TestServer {
         let headers = Arc::new(Mutex::new(HashMap::new()));
         let block_times = Arc::new(Mutex::new(Vec::new()));
 
-        // 以下字段打包给连接处理协程
+        // 以下字段打包给连接处理任务
         let server_data = Arc::clone(&data);
         let server_requests = Arc::clone(&requests);
         let server_conn = Arc::clone(&conn_count);
@@ -372,7 +366,6 @@ async fn handle_conn(
             method: method.clone(),
             path: path.clone(),
             range,
-            at: Instant::now(),
         });
         {
             let mut store = headers.lock().await;
@@ -576,7 +569,7 @@ fn status_reason(code: u16) -> &'static str {
     }
 }
 
-/// 206 分片响应。`prefix` 为 None 发送完整分片；Some(n) 只发送前 n 字节
+/// 206 范围切片响应。`prefix` 为 None 发送完整切片；Some(n) 只发送前 n 字节
 /// （Content-Length 仍报全长——客户端将因响应提前结束而报 partial file）。
 /// `close` 为 true 时带 Connection: close，响应后由调用方结束连接。
 async fn send_range_slice(

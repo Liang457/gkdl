@@ -3,7 +3,7 @@ use crate::download::config::DownloadConfig;
 use crate::download::detector::{SlowThreadDetector, Verdict};
 use crate::download::segment::{Segment, SegmentState};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use tokio::sync::{watch, Mutex, Notify};
+use tokio::sync::{watch, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureAction {
@@ -34,12 +34,11 @@ pub struct WorkStealingScheduler {
     detector: Mutex<SlowThreadDetector>,
     seg_counter: std::sync::atomic::AtomicU64,
     paused: AtomicBool,
-    /// 暂停状态变更信号（watch 版本号）：任何 `set_paused` 都会 +1，
-    /// `wait_resume` 据此可靠唤醒，规避 `Notify::notify_waiters` 在
-    /// 「检查标志后、注册等待前」发出导致唤醒丢失、worker 永久挂起的竞态。
+    /// 暂停状态变更信号：`set_paused` 使版本号 +1，`wait_resume` 据此唤醒。
+    /// 不用 `Notify`：`notify_waiters` 在「检查标志后、注册等待前」发出的
+    /// 唤醒会丢失（worker 永久挂起）；watch 的版本判定没有这个窗口。
     resume_tx: watch::Sender<()>,
     resume_rx: watch::Receiver<()>,
-    complete_notify: Notify,
     /// 是否已有段被判定失败且无法重试（引擎据此报错）
     failed: AtomicBool,
     /// 流式（单连接整文件）模式：禁止工作窃取，段数恒为 1。
@@ -66,7 +65,6 @@ impl WorkStealingScheduler {
             paused: AtomicBool::new(false),
             resume_tx,
             resume_rx,
-            complete_notify: Notify::new(),
             failed: AtomicBool::new(false),
             streaming: false,
             cooldown_until_ms: AtomicI64::new(0),
@@ -90,7 +88,6 @@ impl WorkStealingScheduler {
             paused: AtomicBool::new(false),
             resume_tx,
             resume_rx,
-            complete_notify: Notify::new(),
             failed: AtomicBool::new(false),
             streaming: true,
             cooldown_until_ms: AtomicI64::new(0),
@@ -124,7 +121,6 @@ impl WorkStealingScheduler {
             paused: AtomicBool::new(false),
             resume_tx,
             resume_rx,
-            complete_notify: Notify::new(),
             failed: AtomicBool::new(false),
             streaming: false,
             cooldown_until_ms: AtomicI64::new(0),
@@ -160,29 +156,21 @@ impl WorkStealingScheduler {
         segs
     }
 
-    #[allow(dead_code)]
     pub fn config(&self) -> &DownloadConfig {
         &self.config
     }
 
-    #[allow(dead_code)]
     pub fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::Relaxed);
-        // 先写标志再发送版本号：任何 set_paused（暂停/恢复）都会唤醒等待者，
-        // 由它们自行重查标志，配合 watch 的版本判定保证不丢唤醒。
+        // 先写标志再发版本号：任何变更都唤醒等待者，由其重查标志
         let _ = self.resume_tx.send(());
     }
 
-    #[allow(dead_code)]
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)
     }
 
     /// 等待解除暂停。暂停中则挂起，直到再次 `set_paused`（版本号 +1）。
-    ///
-    /// 用 `watch` 而非 `Notify`：`notify_waiters` 在「检查标志后、注册等待前」
-    /// 发出的唤醒会被永久丢失（worker 卡死）。watch 的版本号在等待前即完成
-    /// 比较，任何已发生的变更都会让 `changed()` 立即返回。
     pub async fn wait_resume(&self) {
         // 只克隆一次接收端：每轮循环内保持旧版本号，变更判定才可靠。
         let mut rx = self.resume_rx.clone();
@@ -196,11 +184,6 @@ impl WorkStealingScheduler {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn mark_failed(&self) {
-        self.failed.store(true, Ordering::Relaxed);
-    }
-
     pub fn has_failed(&self) -> bool {
         self.failed.load(Ordering::Relaxed)
     }
@@ -209,10 +192,8 @@ impl WorkStealingScheduler {
         self.segments.lock().await.clone()
     }
 
-    /// 供持久化使用的轻量段快照：只取库表所需字段，不克隆 `speed_history` 等运行时数据，
-    /// 避免监控协程每秒全量克隆造成堆分配抖动。
-    /// `end` 钳制到 `i64::MAX`：流式未知大小用 `u64::MAX` 作哨兵，SQLite 存 i64
-    /// （rusqlite 对超出 `i64::MAX` 的 u64 报错），不钳制会让流式下载每秒保存状态失败。
+    /// 持久化用的轻量段快照：不含 `speed_history` 等运行时数据，避免监控任务每秒全量克隆。
+    /// `end` 钳到 `i64::MAX`：流式未知大小的段以 `u64::MAX` 为哨兵，SQLite 只存 i64。
     pub async fn segment_records(&self) -> Vec<SegmentRecord> {
         let guard = self.segments.lock().await;
         guard
@@ -251,8 +232,8 @@ impl WorkStealingScheduler {
 
     /// 工作窃取主入口：先拿无主段，否则从最慢段尾部切 40%。
     pub async fn steal_or_checkout(&self, worker_id: usize) -> Option<Segment> {
-        // 暂停时可靠等待恢复（watch 版本号，不丢唤醒）；恢复后只取一次，
-        // 拿不到段/无法窃取即返回 None（worker 退出），与原始语义一致。
+        // 暂停时在 wait_resume 中等待恢复（watch 版本号，不丢唤醒）；
+        // 恢复后只取一次，拿不到段/无法窃取即返回 None（worker 退出）。
         self.wait_resume().await;
         let seg = {
             let mut guard = self.segments.lock().await;
@@ -365,10 +346,8 @@ impl WorkStealingScheduler {
 
     /// 同步 worker 已写字节与速度采样到调度器（供进度展示、续传与慢线程检测）。
     /// 返回调度器当前的段尾：工作窃取可能截短 end，worker 据此钳制本地进度。
-    ///
-    /// worker 只持有段的本地克隆，若不把速度采样回写，调度器侧的 `speed_history`
-    /// 永远是空的——`check_slow` 的对等节点与 `find_slowest` 就拿不到真实速度，
-    /// 慢线程杀停与「窃取最慢段」都会退化为永远 Healthy / 任选一段。
+    /// worker 只持有段的本地克隆，速度采样必须在此回写，否则慢线程检测
+    /// 与窃取最慢段拿不到真实速度。
     pub async fn update_progress(
         &self,
         seg_id: u64,
@@ -400,12 +379,7 @@ impl WorkStealingScheduler {
             let max_written = t.end.saturating_sub(t.start);
             t.written = seg.written.max(t.written).min(max_written);
         }
-        let done = guard.iter().all(|s| s.state == SegmentState::Complete);
-        drop(guard);
-        if done {
-            self.complete_notify.notify_waiters();
-        }
-        done
+        guard.iter().all(|s| s.state == SegmentState::Complete)
     }
 
     /// 段失败归还（供重试或他 worker 继续）。
@@ -418,9 +392,9 @@ impl WorkStealingScheduler {
                 t.written = seg.written.max(t.written).min(max_written);
                 t.clear_speed();
                 t.owner_id = usize::MAX;
-                // 工作窃取截短段尾后，worker 本地 written 可能已写满新的分配区间
-                // （字节已在盘上）。此时若仍置 Pending，会出现「剩余 0 字节的
-                // Pending 段」永远不会被 checkout，导致整个下载被误判失败。
+                // 窃取截短段尾后，worker 本地 written 可能已写满新分配区间
+                // （字节已在盘上）；若仍置 Pending，剩余 0 字节的段永远不会
+                // 被 checkout，整个下载被误判失败。
                 if t.written >= max_written {
                     t.state = SegmentState::Complete;
                 } else {
@@ -508,17 +482,9 @@ impl WorkStealingScheduler {
                 delay_ms: SEGMENT_BACKOFF_BASE_MS.saturating_mul(1 << shift),
             };
         }
-        FailureAction::Retry { delay_ms: 0 }
-    }
-
-    #[allow(dead_code)]
-    pub async fn wait_complete(&self) {
-        loop {
-            if self.all_done().await {
-                return;
-            }
-            self.complete_notify.notified().await;
-        }
+        // 未知 seg_id 不应发生（段表只增不删、id 单调分配）；宁可放弃也不零延迟重试
+        tracing::error!("record_failure: 未知段 {seg_id}，按放弃处理");
+        FailureAction::Abandon
     }
 
     /// 终态清理：清空各段速度历史并收缩段表容量，释放工作窃取期间积累的临时内存。
@@ -549,8 +515,8 @@ mod tests {
     fn initial_split_respects_min_size() {
         let segs = WorkStealingScheduler::initial_split(1_000_000, &cfg());
         assert_eq!(segs.len(), 4);
-        assert!(segs.iter().all(|s| s.len() >= 1024));
-        let total: u64 = segs.iter().map(|s| s.len()).sum();
+        assert!(segs.iter().all(|s| s.byte_len() >= 1024));
+        let total: u64 = segs.iter().map(|s| s.byte_len()).sum();
         assert_eq!(total, 1_000_000);
         // 首尾连续
         for w in segs.windows(2) {
@@ -792,9 +758,8 @@ mod tests {
 
     #[tokio::test]
     async fn update_progress_records_speed_samples_to_scheduler() {
-        // 回归：worker 只持有段的本地克隆，若 update_progress 不把速度采样回写，
-        // 调度器侧的 speed_history 永远是空的，check_slow 的对等节点与 find_slowest
-        // 拿不到真实速度，慢线程杀停与「窃取最慢段」永久失效。
+        // 守护：update_progress 必须把速度采样回写调度器——worker 只持有本地克隆，
+        // 不回写则 check_slow 与 find_slowest 拿不到真实速度，慢线程杀停与窃取失效。
         let sched = WorkStealingScheduler::new(1_000_000, cfg());
         sched.steal_or_checkout(0).await.unwrap(); // seg0 -> Downloading
         for i in 0..6 {
@@ -811,8 +776,8 @@ mod tests {
 
     #[tokio::test]
     async fn segment_records_clamps_streaming_sentinel_end() {
-        // 回归：流式未知大小段以 u64::MAX 作 end 哨兵，SQLite 存 i64，
-        // 不钳制会让持久化报错（rusqlite 拒绝超出 i64::MAX 的 u64）。
+        // 守护：流式未知大小的段以 u64::MAX 作 end 哨兵，持久化前钳到 i64::MAX
+        // （SQLite 只存 i64）。
         let sched = WorkStealingScheduler::streaming(cfg(), None);
         let recs = sched.segment_records().await;
         assert_eq!(recs.len(), 1);
@@ -831,9 +796,8 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_marks_fully_written_segment_complete() {
-        // 回归：窃取截短段尾后，worker 本地可能已写满原区间（字节已在盘上）。
-        // cancel 应把这种段判为 Complete；若留成 0 剩余的 Pending 段，
-        // 它永远不会被 checkout，all_done 永不成立，整个任务被误报失败。
+        // 守护：窃取截短段尾后，worker 本地可能已写满原区间（字节已在盘上），
+        // cancel 应判 Complete；留成 0 剩余的 Pending 段会令 all_done 永不成立。
         let sched = WorkStealingScheduler::new(10_000, single_cfg());
         let seg = sched.steal_or_checkout(0).await.unwrap();
         let mut local = seg.clone();
@@ -906,12 +870,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_failure_unknown_segment_retries_without_delay() {
-        // 未知段（如段表已变更）不计数、立即重试
+    async fn record_failure_unknown_segment_abandons() {
+        // 未知 seg_id 不应发生（段表只增不删）；兜底按放弃处理，不零延迟重试
         let sched = WorkStealingScheduler::new(10_000, cfg());
         assert_eq!(
             sched.record_failure(12_345, 0).await,
-            FailureAction::Retry { delay_ms: 0 }
+            FailureAction::Abandon
         );
     }
 

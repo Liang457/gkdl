@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// 常驻连接：Easy 句柄跨段复用（句柄的连接缓存保留到目标主机的空闲连接）。
-/// 段流干净结束后停回槽位，下一段（含工作窃取分到的碎片）直接复用，
+/// 段流干净结束后停回槽位，下一段（含工作窃取分到的段）直接复用，
 /// 省一次 DNS/TCP/TLS 握手，也不向服务器暴露「高频新建连接」的爬虫特征。
 type PooledConn = (String, Easy);
 
@@ -33,7 +33,7 @@ enum ChunkAction {
     Outcome(SegOutcome),
 }
 
-/// 单个 worker 协程：拉段 → 下载 → 写盘 → 完成/归还。
+/// 单个 worker 任务：拉段 → 下载 → 写盘 → 完成/归还。
 pub struct DownloadWorker {
     worker_id: usize,
     client: Arc<HttpClient>,
@@ -135,7 +135,7 @@ impl DownloadWorker {
             if self.cancel_token.is_cancelled() {
                 return;
             }
-            // 限流冷却期间不发起新请求（重试与偷取均在此排队），可被取消打断
+            // 限流冷却期间不发起新请求（重试与窃取均在此排队），可被取消打断
             if !self.wait_cooldown().await {
                 return;
             }
@@ -213,7 +213,7 @@ impl DownloadWorker {
     }
 
     /// 段流干净结束后把句柄停回常驻槽位：连接缓存可能仍保留空闲连接，
-    /// 下一段（含偷取碎片）直接复用。槽位已有句柄时以最新收到的为准
+    /// 下一段（含窃取的段）直接复用。槽位已有句柄时以最新收到的为准
     /// （旧的可能是换源前的残留）。
     fn park_conn(&self, url: &str, easy: Easy) {
         let mut guard = self.pooled.lock().unwrap();
@@ -234,7 +234,7 @@ impl DownloadWorker {
         let end = seg.end; // exclusive
 
         // 常驻连接仅在 URL 与当前源一致时复用；不一致（换源）或取出失败则
-        // 静默回退到新建连接（复用只是优化，绝不影响正确性）。
+        // 静默回退到新建连接：复用只是优化，不影响正确性。
         // 检查与取出在同一次加锁内完成，不留锁窗口。
         let pooled = {
             let mut guard = self.pooled.lock().unwrap();
@@ -310,7 +310,7 @@ impl DownloadWorker {
         };
 
         // 读超时语义：两次 chunk 间隔超时（每次读后重置），更贴合低网速
-        let timeout = std::time::Duration::from_secs(self.config.timeout.max(5));
+        let timeout = std::time::Duration::from_secs(self.client.timeout_secs());
         // 提前退出路径统一先刷盘，防止「已计入 written 但仍在写缓冲」的字节丢失：
         // 否则调度器/状态库记录的进度会跳过这些字节，续传生成损坏文件。
         let flush_early = |buf: &mut WriteBuffer| {
@@ -490,7 +490,7 @@ impl DownloadWorker {
         self.finish_segment(seg, &mut buf, &source, killed).await
     }
 
-    /// 处理单个数据块（保留原 chunk 内全部逻辑）。
+    /// 处理单个数据块。
     async fn handle_chunk(
         &self,
         seg: &mut Segment,
@@ -626,7 +626,7 @@ mod tests {
     #[test]
     fn write_buffer_writes_exact_bytes_at_exact_offsets() {
         // 连续写合入缓冲；区间不连续立即按旧偏移刷盘；缓冲满即落盘。
-        // 逐字节回读内容与偏移——写错位置的缓冲实现必须在此暴露。
+        // 守护：逐字节回读内容与偏移，写错位置的缓冲实现在此暴露。
         let p = tmp_path("offsets");
         let writer: Arc<dyn DownloadWriter> = Arc::new(PwriteWriter::new(&p, 256).unwrap());
         let mut buf = WriteBuffer::new(Arc::clone(&writer), 64);

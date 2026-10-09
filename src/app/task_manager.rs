@@ -70,32 +70,20 @@ impl Task {
 
 #[derive(Debug, Clone)]
 pub enum TaskEvent {
-    Started {
-        gid: String,
-    },
-    Paused {
-        gid: String,
-    },
-    Stopped {
-        gid: String,
-    },
-    Complete {
-        gid: String,
-    },
-    #[allow(dead_code)]
-    Error {
-        gid: String,
-        code: i32,
-    },
+    Started { gid: String },
+    Paused { gid: String },
+    Stopped { gid: String },
+    Complete { gid: String },
+    Error { gid: String, code: i32 },
 }
 
 /// 并发下载门控：限制同时下载的任务数。`max == 0` 表示不限。
 pub struct ConcurrencyGate {
     max: AtomicU64,
     active: AtomicU64,
-    /// 状态变更信号（watch 版本号）：`set_max` 与槽位释放必然 +1。
-    /// `acquire` 依赖版本判定可靠唤醒，规避 `Notify::notify_waiters`
-    /// 在「检查后、注册前」发出导致排队任务永久挂起的竞态。
+    /// 状态变更信号：`set_max` 与槽位释放使版本号 +1，`acquire` 据此唤醒。
+    /// 不用 `Notify`：`notify_waiters` 在「检查后、注册前」发出的唤醒会丢失
+    /// （排队任务永久挂起）；watch 的版本判定没有这个窗口。
     notify_tx: watch::Sender<()>,
     notify_rx: watch::Receiver<()>,
 }
@@ -158,17 +146,17 @@ impl ConcurrencyGate {
     }
 }
 
-impl Default for ConcurrencyGate {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// 并发槽位守卫：Drop 时释放并唤醒等待者。
 pub struct ConcurrencyPermit<'a> {
     gate: &'a ConcurrencyGate,
     /// 是否实际占了 active 计数（max==0 时不占）
     counted: bool,
+}
+
+impl Default for ConcurrencyGate {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Drop for ConcurrencyPermit<'_> {
@@ -181,11 +169,8 @@ impl Drop for ConcurrencyPermit<'_> {
     }
 }
 
-/// 输出路径占用状态。
-///
-/// 多个任务可指向同一输出路径（默认按文件名解析）。记录当前占用该路径的任务，
-/// 以及该路径上是否已存在一份完整下载结果，用于防止「旧任务迟到的清理」误删
-/// 「新任务已下载完成」的文件。
+/// 输出路径占用状态。多个任务可指向同一输出路径：记录当前占用者与该路径
+/// 是否已有完整下载结果，防止旧任务迟到的清理误删新任务的完成文件。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct PathOwnership {
     /// 当前占用该输出路径的任务 GID（无占用者为 None）。
@@ -332,7 +317,7 @@ impl TaskManager {
     }
 
     /// 从状态库恢复中断任务（active/paused）。恢复后的任务进入「暂停」状态，
-    /// 不自动重启；用户 unpause 后驱动协程会按状态库记录续传（磁盘）或重下（内存）。
+    /// 不自动重启；用户 unpause 后驱动任务会按状态库记录续传（磁盘）或重下（内存）。
     pub async fn rehydrate_from_db(self: &Arc<Self>) -> Result<usize> {
         let Some(db) = &self.db else {
             return Ok(0);
@@ -350,7 +335,7 @@ impl TaskManager {
     }
 
     async fn rehydrate_task(self: &Arc<Self>, rec: DownloadRecord) -> Result<()> {
-        // 用记录里的分片/限速参数重建配置（UA/超时等沿用默认值，续传时影响不大）
+        // 用记录里的段数/限速参数重建配置（UA/超时等沿用默认值，续传时影响不大）
         let config = DownloadConfig {
             split: rec.split.max(1),
             min_split_size: rec.min_split_size,
@@ -396,7 +381,7 @@ impl TaskManager {
         Ok(())
     }
 
-    /// 启动任务的驱动协程：等待并发槽位 → 启动引擎 → 监听状态/事件。
+    /// 为任务启动 driver：等待并发槽位 → 启动引擎 → 监听状态/事件。
     /// `task.status` 的初始值决定行为（Waiting 自动启动；Paused 等待 unpause）。
     async fn spawn_driver(
         self: &Arc<Self>,
@@ -439,11 +424,6 @@ impl TaskManager {
                 break p;
             };
             let _permit = permit;
-            if task_for_driver.task_token.is_cancelled()
-                || *task_for_driver.status.lock().unwrap() == TaskStatus::Removed
-            {
-                return;
-            }
 
             // 探测与下载共用的取消令牌：启动前即存入任务，保证探测阶段也可被取消
             let ct = CancellationToken::new();
@@ -473,17 +453,13 @@ impl TaskManager {
             {
                 Ok(h) => h,
                 Err(e) => {
-                    // 探测失败；若任务已被移除/取消则不再报错（任务已删除）
-                    if task_for_driver.status() != TaskStatus::Removed
-                        && !task_for_driver.task_token.is_cancelled()
-                    {
-                        mgr.finish_error(&task_for_driver, e).await;
-                    }
+                    // finish_error 内部会忽略已取消/已移除任务的错误
+                    mgr.finish_error(&task_for_driver, e).await;
                     return;
                 }
             };
 
-            // 探测期间任务已被移除/取消：取消引擎并清理临时文件，绝不重新激活
+            // 探测期间任务已被移除/取消：取消引擎并清理临时文件
             if task_for_driver.task_token.is_cancelled()
                 || *task_for_driver.status.lock().unwrap() == TaskStatus::Removed
             {
@@ -536,7 +512,7 @@ impl TaskManager {
                 }
             }
 
-            // 任务已被移除：清理控制文件与部分文件
+            // 任务已被移除：清理状态记录与部分文件
             if *task_for_driver.status.lock().unwrap() == TaskStatus::Removed {
                 mgr.cleanup_incomplete_files(&task_for_driver).await;
             }
@@ -570,13 +546,11 @@ impl TaskManager {
         *task.error_message.lock().unwrap() = Some(msg.clone());
         task.error_code
             .store(map_error_code(&msg), Ordering::Relaxed);
-        if task.status() != TaskStatus::Removed {
-            *task.status.lock().unwrap() = TaskStatus::Error;
-            let _ = self.events.send(TaskEvent::Error {
-                gid: task.gid.clone(),
-                code: task.error_code.load(Ordering::Relaxed),
-            });
-        }
+        *task.status.lock().unwrap() = TaskStatus::Error;
+        let _ = self.events.send(TaskEvent::Error {
+            gid: task.gid.clone(),
+            code: task.error_code.load(Ordering::Relaxed),
+        });
     }
 
     async fn run_hook(self: &Arc<Self>, task: &Arc<Task>) {
@@ -608,7 +582,7 @@ impl TaskManager {
                 Err(e) => tracing::warn!("读取下载后命令配置失败: {e}"),
             }
         }
-        // 旧式单脚本方式（CLI --post-script）
+        // 单脚本方式（CLI --post-script）
         if let Some(script) = &self.hook.script {
             if let Err(e) = hooks::run_post_download_script(script, ctx).await {
                 tracing::warn!("下载后脚本执行失败: {e}");
@@ -793,11 +767,11 @@ impl TaskManager {
                 tracing::warn!("删除任务 {} 的状态记录失败: {}", task.gid, e);
             }
         }
-        // 清理旧版控制文件残留（新版本不再生成，仅防御性删除）
+        // 防御性清理旧格式的 `.gkdl` 控制文件残留（现行版本不生成）
         let legacy = PathBuf::from(format!("{}.gkdl", task.out_path.display()));
         std::fs::remove_file(&legacy).ok();
         std::fs::remove_file(legacy.with_extension("gkdl.tmp")).ok();
-        // 清理流式/内存模式残留的临时文件（`{stem}.gkdl.tmp`，与旧版命名不同）
+        // 清理流式/内存模式的临时文件（`{stem}.gkdl.tmp`）
         std::fs::remove_file(task.out_path.with_extension("gkdl.tmp")).ok();
         // 仅在确认该路径仍归属本任务（或已无占用且无完整结果）时删除输出文件，
         // 防止旧任务迟到的清理误删新任务已下载完成的文件。
@@ -957,7 +931,7 @@ mod tests {
             "释放后无占用且无完整结果，条目应被移除并允许删除"
         );
 
-        // 无任何记录/占用的路径允许删除（旧版防御性清理路径）
+        // 无任何记录/占用的路径允许删除
         let fresh_path = PathBuf::from("C:/dl/other.bin");
         assert!(mgr.can_delete_path(&fresh_path, old));
     }
