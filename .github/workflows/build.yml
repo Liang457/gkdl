@@ -85,9 +85,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           zip="gkdl-v${GITHUB_REF_NAME#v}-windows-x86_64.zip"
-          # Release 已存在（如重跑）则只补传产物，避免 create 报错
-          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" "$zip" --clobber
+          # 本作业不检出仓库，gh 必须用 -R 显式指定仓库（默认靠 git remote 探测会报 not a git repository）
+          if gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" "$zip" --clobber
           else
-            gh release create "$GITHUB_REF_NAME" "$zip" --title "$GITHUB_REF_NAME" --generate-notes
+            gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" "$zip" --title "$GITHUB_REF_NAME" --generate-notes
           fi
