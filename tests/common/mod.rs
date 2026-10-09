@@ -491,12 +491,18 @@ async fn handle_conn(
                 continue;
             }
             let (start, end) = range.unwrap_or((0, total - 1));
-            // fetch_update 保证计数器耗尽后不再截断（fetch_sub 会在 0 处下溢回绕）
-            let cut = truncate_left
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .ok()
-                .filter(|&n| n > 0)
-                .map(|_| (end - start + 1) * 2 / 5);
+            // 自旋 CAS 扣减截断名额，名额耗尽后不再截断（fetch_sub 会在 0 处下溢回绕）
+            let mut cur = truncate_left.load(Ordering::SeqCst);
+            let cut = loop {
+                let Some(next) = cur.checked_sub(1) else {
+                    break None;
+                };
+                match truncate_left.compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+                {
+                    Ok(_) => break Some((end - start + 1) * 2 / 5),
+                    Err(actual) => cur = actual,
+                }
+            };
             send_range_slice(&mut socket, &data, start, end, total, cut, cut.is_some()).await;
             if cut.is_some() {
                 return; // 提前断开，模拟传输中断
