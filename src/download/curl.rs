@@ -30,8 +30,11 @@ pub enum CurlMsg {
     Headers { status: u32 },
     /// 一块响应体数据。
     Data(Vec<u8>),
-    /// 传输结束（成功或失败）。
-    End(Result<(), curl::Error>),
+    /// 传输结束（成功或失败）。一并归还 Easy 句柄——其连接缓存可能仍保留
+    /// 到目标主机的空闲连接，worker 据此跨段复用连接（每段省一次 DNS/TCP/TLS
+    /// 握手，也避免向服务器暴露「高频新建连接」的爬虫特征）。接收端丢弃时
+    /// 句柄随通道一起销毁，连接自然关闭。
+    End(Result<(), curl::Error>, Easy),
 }
 
 /// 基于 libcurl 的 HTTP 客户端（线程安全，可跨协程共享）。
@@ -381,7 +384,8 @@ impl HttpClient {
 
         let handle = tokio::task::spawn_blocking(move || {
             let result = easy.perform();
-            let _ = tx_end.blocking_send(CurlMsg::End(result));
+            // 归还句柄（连接缓存随句柄保留）；接收端已丢弃则发送失败，句柄就地销毁
+            let _ = tx_end.blocking_send(CurlMsg::End(result, easy));
         });
         Ok((rx, handle))
     }

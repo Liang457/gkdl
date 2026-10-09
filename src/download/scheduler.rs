@@ -2,13 +2,28 @@ use crate::app::db::SegmentRecord;
 use crate::download::config::DownloadConfig;
 use crate::download::detector::{SlowThreadDetector, Verdict};
 use crate::download::segment::{Segment, SegmentState};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use tokio::sync::{watch, Mutex, Notify};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureAction {
-    Retry,
+    /// 重试：携带建议退避毫秒数（段级指数退避；全局限流冷却由 worker 循环顶部另行等待）
+    Retry {
+        delay_ms: u64,
+    },
     Abandon,
+}
+
+/// 段级退避基数（毫秒）：第 n 次失败等待 基数 × 2^(n-1)。
+const SEGMENT_BACKOFF_BASE_MS: u64 = 500;
+
+/// 当前 Unix 时间（毫秒）。冷却截止时刻存原子量只能用墙钟；
+/// 系统对时最多让一次冷却提前/延后结束，无碍语义。
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// 工作窃取调度器：段分配 / 归还 / 窃取 / 完成判定。
@@ -29,6 +44,12 @@ pub struct WorkStealingScheduler {
     failed: AtomicBool,
     /// 流式（单连接整文件）模式：禁止工作窃取，段数恒为 1。
     streaming: bool,
+    /// 全局限流冷却截止时刻（Unix 毫秒）：收到 403/429 时由 worker 设置，
+    /// 所有 worker 发起新请求（取段/重试）前须等它过期。0 表示无冷却。
+    cooldown_until_ms: AtomicI64,
+    /// 当前冷却时长（毫秒）：冷却未过期期间再次命中则翻倍（指数退避，封顶），
+    /// 已过期则重置回基数——避免间隔很久的两次限流被错误地累进放大。
+    cooldown_step_ms: AtomicU64,
 }
 
 impl WorkStealingScheduler {
@@ -48,6 +69,8 @@ impl WorkStealingScheduler {
             complete_notify: Notify::new(),
             failed: AtomicBool::new(false),
             streaming: false,
+            cooldown_until_ms: AtomicI64::new(0),
+            cooldown_step_ms: AtomicU64::new(0),
         }
     }
 
@@ -70,6 +93,8 @@ impl WorkStealingScheduler {
             complete_notify: Notify::new(),
             failed: AtomicBool::new(false),
             streaming: true,
+            cooldown_until_ms: AtomicI64::new(0),
+            cooldown_step_ms: AtomicU64::new(0),
         }
     }
 
@@ -102,6 +127,8 @@ impl WorkStealingScheduler {
             complete_notify: Notify::new(),
             failed: AtomicBool::new(false),
             streaming: false,
+            cooldown_until_ms: AtomicI64::new(0),
+            cooldown_step_ms: AtomicU64::new(0),
         }
     }
 
@@ -438,7 +465,34 @@ impl WorkStealingScheduler {
         }
     }
 
-    /// 记录段失败并递增重试计数。返回应重试还是放弃。
+    /// 命中限流信号（HTTP 403/429）：设置/延长全局限流冷却。
+    ///
+    /// 冷却未过期期间再次命中 → 时长翻倍（指数退避，封顶 `cooldown_max_ms`）；
+    /// 已过期后命中 → 重置回基数 `cooldown_base_ms`（间隔很久的两次限流不累进）。
+    /// 原子操作实现，无锁：worker 在请求路径上高频查询 `cooldown_remaining_ms`。
+    pub fn hit_rate_limit(&self) {
+        let now = unix_now_ms();
+        let base = self.config.cooldown_base_ms.max(100);
+        let max = self.config.cooldown_max_ms.max(base);
+        let step = if self.cooldown_until_ms.load(Ordering::Relaxed) > now {
+            self.cooldown_step_ms.load(Ordering::Relaxed).max(base) * 2
+        } else {
+            base
+        }
+        .min(max);
+        self.cooldown_step_ms.store(step, Ordering::Relaxed);
+        self.cooldown_until_ms
+            .store(now.saturating_add(step as i64), Ordering::Relaxed);
+    }
+
+    /// 距全局限流冷却结束还剩多少毫秒（0 = 无冷却）。
+    pub fn cooldown_remaining_ms(&self) -> u64 {
+        let now = unix_now_ms();
+        let until = self.cooldown_until_ms.load(Ordering::Relaxed);
+        until.saturating_sub(now).max(0) as u64
+    }
+
+    /// 记录段失败并递增重试计数。返回应重试（含段级指数退避毫秒数）还是放弃。
     pub async fn record_failure(&self, seg_id: u64, written: u64) -> FailureAction {
         let mut guard = self.segments.lock().await;
         if let Some(t) = guard.iter_mut().find(|s| s.seg_id == seg_id) {
@@ -448,8 +502,13 @@ impl WorkStealingScheduler {
             if t.retries >= self.config.max_retries {
                 return FailureAction::Abandon;
             }
+            // 指数退避：500ms → 1s → 2s → …（位移封顶，防 max_retries 配得极大时溢出）
+            let shift = (t.retries - 1).min(5);
+            return FailureAction::Retry {
+                delay_ms: SEGMENT_BACKOFF_BASE_MS.saturating_mul(1 << shift),
+            };
         }
-        FailureAction::Retry
+        FailureAction::Retry { delay_ms: 0 }
     }
 
     #[allow(dead_code)]
@@ -678,6 +737,59 @@ mod tests {
         assert_eq!(idx, 1);
     }
 
+    #[test]
+    fn rate_limit_cooldown_doubles_caps_and_resets() {
+        let config = DownloadConfig {
+            cooldown_base_ms: 1000,
+            cooldown_max_ms: 4000,
+            ..Default::default()
+        };
+        let sched = WorkStealingScheduler::new(1000, config);
+        // 首次命中：基数
+        sched.hit_rate_limit();
+        let r1 = sched.cooldown_remaining_ms();
+        assert!(r1 > 800 && r1 <= 1000, "首次冷却应为基数: {r1}");
+        // 冷却期内再命中：翻倍
+        sched.hit_rate_limit();
+        let r2 = sched.cooldown_remaining_ms();
+        assert!(r2 > 1800 && r2 <= 2000, "冷却期内应翻倍: {r2}");
+        // 封顶 cooldown_max_ms
+        sched.hit_rate_limit();
+        sched.hit_rate_limit();
+        let r3 = sched.cooldown_remaining_ms();
+        assert!(r3 > 3000 && r3 <= 4000, "冷却应封顶: {r3}");
+        // 过期后命中：重置回基数（间隔很久的两次限流不累进）
+        sched
+            .cooldown_until_ms
+            .store(unix_now_ms() - 1, Ordering::Relaxed);
+        sched.hit_rate_limit();
+        let r4 = sched.cooldown_remaining_ms();
+        assert!(r4 > 800 && r4 <= 1000, "过期后应重置回基数: {r4}");
+    }
+
+    #[test]
+    fn cooldown_expires_to_zero() {
+        let sched = WorkStealingScheduler::new(1000, DownloadConfig::default());
+        assert_eq!(sched.cooldown_remaining_ms(), 0, "初始无冷却");
+        sched
+            .cooldown_until_ms
+            .store(unix_now_ms() - 1, Ordering::Relaxed);
+        assert_eq!(sched.cooldown_remaining_ms(), 0, "过期后应视为无冷却");
+    }
+
+    #[tokio::test]
+    async fn record_failure_backs_off_exponentially_then_abandons() {
+        // cfg() 的 max_retries 为默认值 3
+        let sched = WorkStealingScheduler::new(10_000, cfg());
+        sched.steal_or_checkout(0).await.unwrap();
+        let d1 = sched.record_failure(0, 0).await;
+        assert_eq!(d1, FailureAction::Retry { delay_ms: 500 });
+        let d2 = sched.record_failure(0, 0).await;
+        assert_eq!(d2, FailureAction::Retry { delay_ms: 1000 });
+        let d3 = sched.record_failure(0, 0).await;
+        assert_eq!(d3, FailureAction::Abandon);
+    }
+
     #[tokio::test]
     async fn update_progress_records_speed_samples_to_scheduler() {
         // 回归：worker 只持有段的本地克隆，若 update_progress 不把速度采样回写，
@@ -706,5 +818,157 @@ mod tests {
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].end, i64::MAX as u64);
         assert!(recs[0].end < u64::MAX);
+    }
+
+    /// 单段调度器（split=1），供断言「全任务级」状态的测试使用。
+    fn single_cfg() -> DownloadConfig {
+        DownloadConfig {
+            split: 1,
+            min_split_size: 1024,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_marks_fully_written_segment_complete() {
+        // 回归：窃取截短段尾后，worker 本地可能已写满原区间（字节已在盘上）。
+        // cancel 应把这种段判为 Complete；若留成 0 剩余的 Pending 段，
+        // 它永远不会被 checkout，all_done 永不成立，整个任务被误报失败。
+        let sched = WorkStealingScheduler::new(10_000, single_cfg());
+        let seg = sched.steal_or_checkout(0).await.unwrap();
+        let mut local = seg.clone();
+        local.written = local.end - local.start; // 本地写满（含被截短的区间）
+        sched.cancel(&local).await;
+        let segs = sched.segments().await;
+        assert_eq!(
+            segs[0].state,
+            SegmentState::Complete,
+            "写满的段应判 Complete"
+        );
+        assert!(sched.all_done().await, "全部写满后 all_done 应成立");
+    }
+
+    #[tokio::test]
+    async fn complete_clamps_written_to_stolen_segment_end() {
+        // 段被窃取截短后，worker 本地 written 可能越过新段尾（重叠区写的是相同
+        // 字节）。complete 必须把 written 钳回段长，否则进度统计虚高。
+        let sched = WorkStealingScheduler::new(100_000, cfg());
+        let seg = sched.steal_or_checkout(0).await.unwrap();
+        {
+            let mut guard = sched.segments.lock().await;
+            guard[0].end = 60_000; // 模拟被窃取截短
+        }
+        let mut local = seg.clone();
+        local.written = 100_000; // 本地仍按原段长上报
+        sched.complete(&local).await;
+        let segs = sched.segments().await;
+        assert_eq!(segs[0].written, 60_000, "written 应钳制到截短后的段长");
+    }
+
+    #[tokio::test]
+    async fn from_resume_keeps_complete_and_resets_runtime_state() {
+        // 续传快照归一化：Complete 段原样保留；其余归位 Pending 且保留 written；
+        // owner/retries/速度历史等运行时状态全部清零；seg_id 重排为 0..n。
+        let mut done = Segment::new(99, 0, 50_000, 20);
+        done.written = 50_000;
+        done.state = SegmentState::Complete;
+        done.owner_id = 7;
+        done.retries = 3;
+        done.record_speed(123.0);
+        let mut part = Segment::new(100, 50_000, 100_000, 20);
+        part.written = 10_000;
+        part.state = SegmentState::Downloading;
+        part.owner_id = 8;
+        part.retries = 2;
+        part.record_speed(5.0);
+
+        let sched = WorkStealingScheduler::from_resume(vec![done, part], cfg());
+        let segs = sched.segments().await;
+        assert_eq!(segs[0].seg_id, 0);
+        assert_eq!(segs[1].seg_id, 1);
+        assert_eq!(segs[0].state, SegmentState::Complete);
+        assert_eq!(segs[0].written, 50_000);
+        assert_eq!(
+            segs[1].state,
+            SegmentState::Pending,
+            "Downloading 应归位 Pending"
+        );
+        assert_eq!(segs[1].written, 10_000, "部分进度的段应保留 written");
+        for s in &segs {
+            assert_eq!(s.owner_id, usize::MAX, "owner 应清零");
+            assert_eq!(s.retries, 0, "retries 应清零");
+            assert!(s.speed_history.is_empty(), "速度历史应清空");
+        }
+        // Pending 段可被 checkout，且从 written 处继续（position = start + written）
+        let got = sched.steal_or_checkout(0).await.unwrap();
+        assert_eq!(got.seg_id, 1);
+        assert_eq!(got.position_to_write(), 60_000);
+    }
+
+    #[tokio::test]
+    async fn record_failure_unknown_segment_retries_without_delay() {
+        // 未知段（如段表已变更）不计数、立即重试
+        let sched = WorkStealingScheduler::new(10_000, cfg());
+        assert_eq!(
+            sched.record_failure(12_345, 0).await,
+            FailureAction::Retry { delay_ms: 0 }
+        );
+    }
+
+    #[tokio::test]
+    async fn abandon_marks_failed_and_prevents_redownload() {
+        // 重试耗尽放弃：段标记 Cancelled 不再分派，failed 置位供引擎报错
+        let sched = WorkStealingScheduler::new(10_000, single_cfg()); // max_retries 默认 3
+        let seg = sched.steal_or_checkout(0).await.unwrap();
+        for _ in 0..3 {
+            sched.record_failure(seg.seg_id, 0).await;
+        }
+        sched.abandon(&seg).await;
+        assert!(sched.has_failed(), "放弃后 failed 应置位");
+        let segs = sched.segments().await;
+        assert_eq!(segs[0].state, SegmentState::Cancelled);
+        assert!(
+            sched.steal_or_checkout(1).await.is_none(),
+            "Cancelled 段不得再被 checkout/窃取"
+        );
+        assert!(!sched.all_done().await, "放弃的段不算完成");
+    }
+
+    #[test]
+    fn steal_ratio_out_of_range_is_clamped() {
+        // steal_ratio 越界钳制到 (0,1]：不钳制会 cut >= remaining，
+        // 导致 slowest.end - cut_size 下溢（debug panic / release 回绕成巨大段）。
+        let mut config = cfg();
+        config.steal_ratio = 5.0;
+        let mut segs = vec![Segment::new(0, 0, 100_000, 20)];
+        segs[0].owner_id = 0;
+        segs[0].state = SegmentState::Downloading;
+        segs[0].written = 10_000;
+        let stolen = WorkStealingScheduler::steal_locked(&mut segs, 1, &config, 1, false).unwrap();
+        assert!(
+            stolen.start >= segs[0].position_to_write(),
+            "切点不得越过已写位置"
+        );
+        assert_eq!(stolen.end, 100_000);
+        assert_eq!(stolen.start, segs[0].end, "原段尾应截到窃取段起点");
+        assert!(segs[0].end <= 100_000);
+    }
+
+    #[test]
+    fn hit_rate_limit_clamps_tiny_base_and_max() {
+        // base/max 配 0：base 钳到 100ms，max 钳到 >= base，冷却不为 0 也不超上限
+        let config = DownloadConfig {
+            cooldown_base_ms: 0,
+            cooldown_max_ms: 0,
+            ..Default::default()
+        };
+        let sched = WorkStealingScheduler::new(1000, config);
+        sched.hit_rate_limit();
+        let r1 = sched.cooldown_remaining_ms();
+        assert!(r1 > 0 && r1 <= 100, "最小冷却基数应为 100ms: {r1}");
+        // 冷却期内再命中翻倍后仍被 max(=base) 封顶
+        sched.hit_rate_limit();
+        let r2 = sched.cooldown_remaining_ms();
+        assert!(r2 > 0 && r2 <= 100, "冷却应封顶在 100ms: {r2}");
     }
 }

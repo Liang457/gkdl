@@ -529,7 +529,7 @@ pub async fn start_download(
                     cancel_task.clone(),
                 );
                 let worker = if i == 0 {
-                    worker.with_warm_conn(warm_for_worker.take())
+                    worker.with_pooled_conn(warm_for_worker.take())
                 } else {
                     worker
                 };

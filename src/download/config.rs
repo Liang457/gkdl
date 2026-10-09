@@ -73,13 +73,20 @@ pub struct DownloadConfig {
     /// 流式（压缩）下载由 libcurl 自动解压，暂停/重试即从头重新下载，无法断点续传。
     #[serde(default = "default_allow_compression")]
     pub allow_compression: bool,
+    /// 限流冷却基数（毫秒）：任一 worker 收到 HTTP 403/429 时，任务全局暂停
+    /// 发起新请求这么久；冷却未过期期间再次命中则时长翻倍。
+    #[serde(default = "default_cooldown_base_ms")]
+    pub cooldown_base_ms: u64,
+    /// 限流冷却时长上界（毫秒），防指数退避无界增长。
+    #[serde(default = "default_cooldown_max_ms")]
+    pub cooldown_max_ms: u64,
 }
 
 fn default_split() -> usize {
     8
 }
 fn default_min_split_size() -> u64 {
-    256 * 1024
+    4 * 1024 * 1024
 }
 fn default_memory_threshold() -> u64 {
     8 * 1024 * 1024
@@ -122,6 +129,14 @@ fn default_allow_compression() -> bool {
     true
 }
 
+fn default_cooldown_base_ms() -> u64 {
+    5000
+}
+
+fn default_cooldown_max_ms() -> u64 {
+    60 * 1000
+}
+
 /// 默认 User-Agent：Firefox 浏览器 UA（公开给 engine 作空值兜底）。
 pub fn default_user_agent() -> String {
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:154.0) Gecko/20100101 Firefox/154.0".into()
@@ -151,6 +166,8 @@ impl Default for DownloadConfig {
             referer: String::new(),
             header: Vec::new(),
             allow_compression: default_allow_compression(),
+            cooldown_base_ms: default_cooldown_base_ms(),
+            cooldown_max_ms: default_cooldown_max_ms(),
         }
     }
 }

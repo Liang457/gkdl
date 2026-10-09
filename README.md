@@ -79,10 +79,13 @@ daemon:
   aria_ng_url: ""        # 托盘「打开 AriaNG」地址，留空不显示
 download:
   split: 8
+  min_split_size: 4194304     # 最小分片字节数；工作窃取只在剩余 > 2 倍该值时切碎片
   memory_threshold: 8388608   # 小文件内存模式阈值，0=禁用，上限 64MB
   rate_limit: 0               # 全局限速 B/s，0=不限
   timeout: 30
   allow_compression: true     # 单连接整文件下载允许 gzip/deflate 压缩传输
+  cooldown_base_ms: 5000      # 收到 HTTP 403/429 时任务全局冷却基数（毫秒）
+  cooldown_max_ms: 60000      # 冷却时长上界（冷却期内再次命中则翻倍）
 state:
   retention_days: 7           # 已完成/失败记录保留天数，0=永久
 hook:
@@ -100,6 +103,15 @@ hook:
 - **无法断点续传**：暂停/失败/重试都从头重新下载；不会残留临时文件（原子 rename 落盘）。
 - 该模式下小文件改走磁盘临时文件（不再走内存模式）。
 - RPC 对应选项为 `http-accept-gzip`（`true`/`false`），与 aria2/AriaNg 兼容。
+
+### 反爬/限流应对（连接复用 + 全局冷却）
+
+多线程下载对远端 WAF/反爬保持克制，避免因「高频新建连接 + 高频重试」被误判为爬虫：
+
+- **连接跨段复用**：每个 worker 的 libcurl 句柄在段结束后保留（连接缓存不丢），下一段——包括工作窃取分到的碎片——直接在同一条 TCP/TLS 连接上继续 Range 请求。服务器看到的是固定数量的长连接顺序取块，而非高频新建短连接。换源、复用失败或连接已被服务器关闭时自动回退新建连接，不影响正确性。
+- **全局冷却**：任一 worker 收到 HTTP 403/429，任务内所有 worker 暂停发起新请求 `cooldown_base_ms`（默认 5s）；冷却未过期期间再次命中则时长翻倍，封顶 `cooldown_max_ms`（默认 60s）。正在传输的连接不受影响，冷却到期后自动恢复。
+- **段级指数退避**：段失败后按 500ms → 1s → 2s 退避再重试（`max_retries` 次耗尽后放弃），不再立即重连。
+- 提高多线程场景下对反爬友好度的两个配置旋钮：`min_split_size`（默认已提升至 4 MiB，下载尾部的窃取碎片不再碎到几百 KB）与 `cooldown_base_ms`/`cooldown_max_ms`。
 
 ## 下载后命令
 
