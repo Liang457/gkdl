@@ -161,7 +161,7 @@ gkdl/
 ## 运行环境
 
 - Windows（托盘依赖 winit/tray-icon）
-- libcurl 静态链接（内置 curl 8.21.0），TLS 走 Schannel 系统证书，无需 CA 配置
+- libcurl 静态链接（内置 curl 8.22.0），TLS 走 Schannel 系统证书，无需 CA 配置
 - 中文域名（IDN）由 `idna` 转码
 - SQLite 状态库（rusqlite bundled）
 - 构建需要 PATH 上有 C 编译器，无需 cmake / OpenSSL
