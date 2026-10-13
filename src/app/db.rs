@@ -135,12 +135,12 @@ impl StateDb {
             params![
                 rec.gid,
                 Self::urls_to_json(&rec.urls),
-                rec.total,
+                rec.total as i64,
                 rec.out_path,
                 rec.sha256,
-                rec.rate_limit,
-                rec.split,
-                rec.min_split_size,
+                rec.rate_limit as i64,
+                rec.split as i64,
+                rec.min_split_size as i64,
                 rec.memory_mode as i64,
                 rec.status,
                 rec.created_at,
@@ -160,10 +160,10 @@ impl StateDb {
         for s in &rec.segments {
             stmt.execute(params![
                 rec.gid,
-                s.seg_id,
-                s.start,
-                s.end,
-                s.written,
+                s.seg_id as i64,
+                s.start as i64,
+                s.end as i64,
+                s.written as i64,
                 s.complete as i64,
             ])
             .context("写入段记录失败")?;
