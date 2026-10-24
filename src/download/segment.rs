@@ -54,7 +54,6 @@ impl Segment {
     }
 
     /// 段的字节区间长度（start..end，与已写字节数无关）。
-    #[allow(dead_code)] // 仅供 tests/ 集成测试断言使用
     pub fn byte_len(&self) -> u64 {
         self.end.saturating_sub(self.start)
     }

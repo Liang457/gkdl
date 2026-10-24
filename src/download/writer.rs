@@ -52,7 +52,6 @@ impl MemoryWriter {
     }
 
     /// 只读访问整个缓冲（仅供单元测试断言使用）。
-    #[allow(dead_code)]
     pub fn as_slice(&self) -> &[u8] {
         unsafe { &*self.inner.get() }
     }

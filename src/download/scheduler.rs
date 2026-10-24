@@ -184,10 +184,6 @@ impl WorkStealingScheduler {
         }
     }
 
-    pub fn has_failed(&self) -> bool {
-        self.failed.load(Ordering::Relaxed)
-    }
-
     pub async fn segments(&self) -> Vec<Segment> {
         self.segments.lock().await.clone()
     }
@@ -888,7 +884,6 @@ mod tests {
             sched.record_failure(seg.seg_id, 0).await;
         }
         sched.abandon(&seg).await;
-        assert!(sched.has_failed(), "放弃后 failed 应置位");
         let segs = sched.segments().await;
         assert_eq!(segs[0].state, SegmentState::Cancelled);
         assert!(

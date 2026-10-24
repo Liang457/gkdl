@@ -4,7 +4,7 @@
 
 use clap::Parser;
 use gkdl::app::cli::{Cli, Command, DaemonArgs};
-use gkdl::app::config::{self, ConfigStore, LogConfig};
+use gkdl::app::config::{self, ConfigStore};
 use gkdl::app::db::StateDb;
 use gkdl::app::hooks::HookConfig;
 use gkdl::app::logging;
@@ -61,11 +61,12 @@ async fn run(cli: Cli) -> i32 {
             if !opts.is_empty() {
                 params.push(serde_json::Value::Object(opts));
             }
-            let resp = rpc_client_call(args.port, args.rpc_secret, "aria2.addUri", params).await;
+            let resp =
+                gkdl::rpc::client::call(args.port, args.rpc_secret, "aria2.addUri", params).await;
             print_rpc(resp)
         }
         Some(Command::Pause(args)) => {
-            let resp = rpc_client_call(
+            let resp = gkdl::rpc::client::call(
                 args.port,
                 args.rpc_secret,
                 "aria2.pause",
@@ -75,7 +76,7 @@ async fn run(cli: Cli) -> i32 {
             print_rpc(resp)
         }
         Some(Command::Resume(args)) => {
-            let resp = rpc_client_call(
+            let resp = gkdl::rpc::client::call(
                 args.port,
                 args.rpc_secret,
                 "aria2.unpause",
@@ -85,7 +86,7 @@ async fn run(cli: Cli) -> i32 {
             print_rpc(resp)
         }
         Some(Command::Remove(args)) => {
-            let resp = rpc_client_call(
+            let resp = gkdl::rpc::client::call(
                 args.port,
                 args.rpc_secret,
                 "aria2.remove",
@@ -95,15 +96,6 @@ async fn run(cli: Cli) -> i32 {
             print_rpc(resp)
         }
     }
-}
-
-async fn rpc_client_call(
-    port: u16,
-    secret: Option<String>,
-    method: &str,
-    params: Vec<serde_json::Value>,
-) -> anyhow::Result<serde_json::Value> {
-    gkdl::rpc::client::call(port, secret, method, params).await
 }
 
 fn print_rpc(resp: anyhow::Result<serde_json::Value>) -> i32 {
@@ -171,7 +163,7 @@ async fn run_download(args: gkdl::app::cli::DownloadArgs) -> i32 {
                 None
             }
         });
-    let mgr = TaskManager::new(hook, config.clone(), state_db);
+    let mgr = TaskManager::new(hook, state_db);
 
     let tty = std::io::stdout().is_terminal();
     let gid = match mgr
@@ -333,7 +325,7 @@ async fn run_daemon(args: DaemonArgs) -> i32 {
         }
     };
 
-    let mgr = TaskManager::new(hook, download_cfg, Some(std::sync::Arc::new(state_db)));
+    let mgr = TaskManager::new(hook, Some(std::sync::Arc::new(state_db)));
     mgr.set_max_concurrent(global_opts.max_concurrent_downloads);
     mgr.set_global_rate_limit(global_opts.max_overall_download_limit);
     let global = Arc::new(tokio::sync::Mutex::new(global_opts));
@@ -397,6 +389,11 @@ async fn run_daemon(args: DaemonArgs) -> i32 {
         }
     };
     println!("gkdl daemon 已启动: http://{addr}");
+    if secret.is_empty() {
+        // 任意网页可经 CORS/JSONP/WS 驱动无鉴权的 RPC（addUri 可写任意路径），
+        // 必须在启动时对用户可见，仅写日志不够
+        eprintln!("警告: 未配置 rpc_secret，RPC 接口无鉴权；任意网页均可驱动本 daemon（含向任意路径写文件），建议在 config.yaml 配置 rpc_secret");
+    }
     tracing::info!(
         "daemon 启动: host={} port={} secret={} tray={}",
         daemon_cfg.host,
@@ -412,7 +409,7 @@ async fn run_daemon(args: DaemonArgs) -> i32 {
     // 托盘（可选）
     let (tray_tx, mut tray_rx) = tokio::sync::mpsc::unbounded_channel::<tray::TrayCommand>();
     if !daemon_cfg.no_tray {
-        let log_dir = resolve_log_dir(&config_dir, &file_cfg.log);
+        let log_dir = logging::log_dir(&config_dir, &file_cfg.log.file);
         let aria_ng_url = if daemon_cfg.aria_ng_url.is_empty() {
             None
         } else {
@@ -461,20 +458,6 @@ async fn run_daemon(args: DaemonArgs) -> i32 {
         }
     }
     0
-}
-
-/// 解析日志文件所在目录（与 logging::init_logging 的解析规则一致）。
-fn resolve_log_dir(config_dir: &std::path::Path, log_cfg: &LogConfig) -> std::path::PathBuf {
-    let p = std::path::PathBuf::from(&log_cfg.file);
-    let resolved = if p.is_absolute() {
-        p
-    } else {
-        config_dir.join(p)
-    };
-    resolved
-        .parent()
-        .map(|d| d.to_path_buf())
-        .unwrap_or_else(|| config_dir.to_path_buf())
 }
 
 /// Windows：GUI 子系统程序默认不分配控制台。从终端启动时附着到父进程控制台，

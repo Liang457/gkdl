@@ -131,10 +131,6 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-fn build_client(config: &DownloadConfig) -> Result<HttpClient> {
-    HttpClient::new(config)
-}
-
 /// 构造持久化任务记录（写入状态库）。
 #[allow(clippy::too_many_arguments)]
 fn make_record(
@@ -187,8 +183,7 @@ pub async fn start_download(
         bail!("未提供下载地址");
     }
     let gid = gid.unwrap_or_else(crate::app::task_manager::TaskManager::gen_gid);
-    let client = build_client(&config)?;
-    let client = Arc::new(client);
+    let client = Arc::new(HttpClient::new(&config)?);
 
     // 探测：逐个源尝试，第一个成功的作为主源；失败源禁用。
     // 探测「干净收尾」（206 完整消费）时保留 Easy 句柄，其连接缓存里的
@@ -582,8 +577,7 @@ pub async fn start_download(
     })
 }
 
-/// 阻塞式下载入口（生产路径走 `TaskManager`，当前仅供 tests/ 集成测试使用）。
-#[allow(dead_code)]
+/// 阻塞式下载入口（生产路径走 `TaskManager`，供 tests/ 集成测试使用）。
 pub async fn download(
     urls: Vec<String>,
     out_path: Option<PathBuf>,

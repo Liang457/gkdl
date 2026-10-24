@@ -63,22 +63,26 @@ struct HeaderState {
 /// 留出余量防畸形服务器，超出即掐断（放弃复用）。
 const PROBE_BODY_CAP: u64 = 64 * 1024;
 
+/// 从状态行解析状态码：支持 HTTP/1.x（`HTTP/1.1 200 OK`）与 HTTP/2 伪头（`:status: 200`）。
+/// 非状态行返回 None。
+fn parse_status_line(line: &str) -> Option<u32> {
+    if line.starts_with("HTTP/") {
+        return line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u32>().ok());
+    }
+    line.to_ascii_lowercase()
+        .strip_prefix(":status:")
+        .and_then(|s| s.trim().parse::<u32>().ok())
+}
+
 /// 增量解析一行响应头；遇到新的状态行会重置当前块（支持重定向多响应）。
 fn update_header_state(st: &mut HeaderState, data: &[u8]) {
     let line = String::from_utf8_lossy(data);
     let lower = line.to_ascii_lowercase();
     if line.starts_with("HTTP/") || lower.starts_with(":status:") {
-        let parsed = if line.starts_with("HTTP/") {
-            line.split_whitespace()
-                .nth(1)
-                .and_then(|s| s.parse::<u32>().ok())
-        } else {
-            lower
-                .split(':')
-                .nth(1)
-                .and_then(|s| s.trim().parse::<u32>().ok())
-        };
-        st.status = parsed.unwrap_or(0);
+        st.status = parse_status_line(&line).unwrap_or(0);
         st.content_range = None;
         st.content_length = None;
     } else if lower.starts_with("content-range:") {
@@ -344,27 +348,14 @@ impl HttpClient {
         let mut status = 0u32;
         easy.header_function(move |data: &[u8]| {
             let line = String::from_utf8_lossy(data);
-            let lower = line.to_ascii_lowercase();
-            if line.starts_with("HTTP/") || lower.starts_with(":status:") {
-                let parsed = if line.starts_with("HTTP/") {
-                    line.split_whitespace()
-                        .nth(1)
-                        .and_then(|s| s.parse::<u32>().ok())
-                } else {
-                    lower
-                        .split(':')
-                        .nth(1)
-                        .and_then(|s| s.trim().parse::<u32>().ok())
-                };
-                if let Some(s) = parsed {
-                    status = s;
-                    // 状态行出现即上报；HTTP/2 头块无空行结束标记，不能只靠空行触发
-                    if tx_headers
-                        .blocking_send(CurlMsg::Headers { status })
-                        .is_err()
-                    {
-                        return false; // 接收端已丢弃，中止传输
-                    }
+            if let Some(s) = parse_status_line(&line) {
+                status = s;
+                // 状态行出现即上报；HTTP/2 头块无空行结束标记，不能只靠空行触发
+                if tx_headers
+                    .blocking_send(CurlMsg::Headers { status })
+                    .is_err()
+                {
+                    return false; // 接收端已丢弃，中止传输
                 }
             } else if (data == b"\r\n" || data == b"\n")
                 && tx_headers

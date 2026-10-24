@@ -55,7 +55,7 @@ async fn post_download_hook_runs_after_success() {
         // hide_window 开启：.bat 子进程以 CREATE_NO_WINDOW 静默运行，仍应正常执行并输出
         hide_window: true,
     };
-    let mgr = TaskManager::new(hook, DownloadConfig::default(), None);
+    let mgr = TaskManager::new(hook, None);
     let gid = mgr
         .add_download(
             vec![server.url()],
@@ -104,7 +104,7 @@ async fn start_server_with_db(
     ShutdownHandle,
     tokio::sync::mpsc::UnboundedReceiver<ShutdownKind>,
 ) {
-    let mgr = TaskManager::new(HookConfig::default(), DownloadConfig::default(), db.clone());
+    let mgr = TaskManager::new(HookConfig::default(), db.clone());
     let global = Arc::new(Mutex::new(GlobalOptions::default()));
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let shutdown = ShutdownHandle::new(tx);
@@ -215,7 +215,7 @@ async fn change_global_option_persists_to_config_file() {
     let _ = std::fs::remove_file(&cfg_path);
     let store = ConfigStore::new(cfg_path.clone(), Config::default());
 
-    let mgr = TaskManager::new(HookConfig::default(), DownloadConfig::default(), None);
+    let mgr = TaskManager::new(HookConfig::default(), None);
     let global = Arc::new(Mutex::new(GlobalOptions::default()));
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let shutdown = ShutdownHandle::new(tx);

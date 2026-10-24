@@ -174,6 +174,20 @@ pub fn check_token(secret: &str, params: &[Value]) -> bool {
     false
 }
 
+/// 剥离 params[0] 中的 token（aria2 约定）：仅首参数且须为 `token:` 前缀字符串。
+/// 全量过滤会误删以 "token:" 开头的普通参数（如文件名）。
+pub fn strip_token(params: Vec<Value>) -> Vec<Value> {
+    let mut params = params;
+    if params
+        .first()
+        .and_then(|p| p.as_str())
+        .is_some_and(|s| s.starts_with("token:"))
+    {
+        params.remove(0);
+    }
+    params
+}
+
 fn task_status_value(task: &Task) -> Value {
     json!(task.status().as_str())
 }
@@ -643,12 +657,8 @@ async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> R
                 .mgr
                 .all_tasks()
                 .into_iter()
-                .filter(|t| {
-                    matches!(
-                        t.status(),
-                        TaskStatus::Complete | TaskStatus::Error | TaskStatus::Removed
-                    )
-                })
+                // remove() 即从任务表移除，注册表中不存在 Removed 状态的任务
+                .filter(|t| matches!(t.status(), TaskStatus::Complete | TaskStatus::Error))
                 .collect();
             // aria2 存储序：最旧在前，负 offset 分页在 apply_range 内逆序（最新在前）
             stopped.sort_by_key(|t| t.created_at);
@@ -669,12 +679,7 @@ async fn dispatch_inner(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> R
                 .count();
             let stopped = tasks
                 .iter()
-                .filter(|t| {
-                    matches!(
-                        t.status(),
-                        TaskStatus::Complete | TaskStatus::Error | TaskStatus::Removed
-                    )
-                })
+                .filter(|t| matches!(t.status(), TaskStatus::Complete | TaskStatus::Error))
                 .count();
             let speed: u64 = tasks
                 .iter()
@@ -825,10 +830,7 @@ pub async fn dispatch(ctx: MethodCtx<'_>, method: &str, params: &[Value]) -> Rpc
         }
         // aria2 约定：token 在各子调用 params[0] 中（system.* 除外），逐条校验并剥离
         let auth_ok = check_token(ctx.secret, &args);
-        let args: Vec<Value> = args
-            .into_iter()
-            .filter(|p| !p.as_str().map(|s| s.starts_with("token:")).unwrap_or(false))
-            .collect();
+        let args = strip_token(args);
         if !auth_ok {
             results.push(json!({
                 "fault": {"code": 1, "message": "身份认证失败"}
@@ -923,6 +925,33 @@ mod tests {
         assert!(check_token("abc", &[json!("token:abc")]));
         assert!(!check_token("abc", &[json!("token:xyz")]));
         assert!(!check_token("abc", &[json!("abc")]));
+    }
+
+    #[test]
+    fn strip_token_only_strips_first_param() {
+        // 守护：只剥 params[0] 的 token；以 "token:" 开头的普通参数（如文件名）不得误删
+        assert_eq!(
+            strip_token(vec![json!("token:abc"), json!("x")]),
+            vec![json!("x")]
+        );
+        assert_eq!(
+            strip_token(vec![json!("token:a"), json!("token:b")]),
+            vec![json!("token:b")],
+            "非首参数的 token: 前缀字符串是普通参数"
+        );
+        let params = vec![json!("token:out.bin"), json!("n")];
+        assert_eq!(
+            strip_token(params),
+            vec![json!("n")],
+            "首参数带 token: 前缀时剥除首元素"
+        );
+        let params = vec![json!("out.bin"), json!("token:y")];
+        assert_eq!(
+            strip_token(params.clone()),
+            params,
+            "首参数无 token: 前缀时原样返回"
+        );
+        assert_eq!(strip_token(Vec::new()), Vec::<Value>::new());
     }
 
     #[test]

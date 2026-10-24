@@ -105,7 +105,7 @@ pub struct DownloadArgs {
     #[arg(long)]
     pub min_split_size: Option<u64>,
 
-    /// 内存模式阈值（字节）：小于等于该值直接下载到内存，完成后原子落盘；0 或负值禁用
+    /// 内存模式阈值（字节）：小于等于该值直接下载到内存，完成后原子落盘；0 禁用
     #[arg(long)]
     pub memory_threshold: Option<u64>,
 

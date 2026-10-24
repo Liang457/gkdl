@@ -225,6 +225,15 @@ fn resolve_log_path(config_dir: &Path, file: &str) -> PathBuf {
     }
 }
 
+/// 解析日志文件所在目录（相对路径基于配置目录，取日志路径的父目录）。
+/// init_logging 与托盘「打开日志文件夹」共用此规则，避免两处解析漂移。
+pub fn log_dir(config_dir: &Path, file: &str) -> PathBuf {
+    resolve_log_path(config_dir, file)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| config_dir.to_path_buf())
+}
+
 /// 启动归档：把 mtime 日期 ≠ 今天的 `gkdl.log*` 打包进 archive/。
 fn archive_old_logs(config_dir: &Path, log_cfg: &LogConfig, log_path: &Path) -> Result<()> {
     let log_dir = log_path
@@ -341,6 +350,10 @@ fn write_tar<W: Write>(writer: W, files: &[PathBuf]) -> Result<()> {
 }
 
 fn cleanup_archive(archive_dir: &Path, retention_days: u32) {
+    // 0 = 永久保留（与 state.retention_days 语义一致）：不设守卫会把 cutoff 算成 0，删光全部归档
+    if retention_days == 0 {
+        return;
+    }
     let cutoff = std::time::Duration::from_secs(retention_days as u64 * 86400);
     let now = std::time::SystemTime::now();
     if let Ok(entries) = std::fs::read_dir(archive_dir) {

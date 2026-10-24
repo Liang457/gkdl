@@ -52,6 +52,8 @@ gkdl daemon [--config <path>] [--port 6800] [--rpc-secret <secret>] [--no-tray]
 
 `--host`/`--port`/`--rpc-secret` 未显式传入时使用配置文件中的 `daemon.*` 值。
 
+> 安全提示：`rpc_secret` 留空时 RPC 完全无鉴权，而接口放行任意 Origin 的 CORS/JSONP/WebSocket——浏览器中打开的任意网页都可以驱动本 daemon（含 `aria2.addUri` 向任意路径写文件）。建议始终配置 `rpc_secret`。
+
 不带子命令直接运行也进入 daemon 模式。配合 AriaNg：
 
 ```

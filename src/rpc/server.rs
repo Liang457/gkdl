@@ -1,4 +1,4 @@
-use super::methods::{check_token, dispatch, MethodCtx};
+use super::methods::{check_token, dispatch, strip_token, MethodCtx};
 use super::protocol::{self, RpcOut};
 use super::{GlobalOptionsRef, ShutdownHandle};
 use crate::app::config::ConfigStore;
@@ -69,6 +69,41 @@ fn needs_auth(method: &str) -> bool {
     )
 }
 
+/// 鉴权 + 分发公共路径：校验 token（需要时）、剥离 params[0] 的 token（aria2 约定）、
+/// 构造上下文并分发。鉴权失败延迟 1s 返回 Err（携带错误响应体），调用方据此回 HTTP 400。
+async fn authorize_and_dispatch(
+    state: &AppState,
+    method: &str,
+    params: Vec<Value>,
+    id: Option<Value>,
+) -> Result<RpcOut, RpcOut> {
+    if needs_auth(method) && !check_token(&state.secret, &params) {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        return Err(make_out(id, None, 1, "身份认证失败"));
+    }
+    let params = strip_token(params);
+    let ctx = MethodCtx {
+        mgr: &state.mgr,
+        global: &state.global,
+        session_id: &state.session_id,
+        shutdown: &state.shutdown,
+        secret: &state.secret,
+        config: state.config.as_deref(),
+    };
+    match dispatch(ctx, method, &params).await {
+        Ok(v) => Ok(RpcOut::Response {
+            id,
+            result: Some(v),
+            error: None,
+        }),
+        Err((code, message)) => Ok(RpcOut::Response {
+            id,
+            result: None,
+            error: Some(super::protocol::RpcErrorBody { code, message }),
+        }),
+    }
+}
+
 /// 处理单个 JSON-RPC 请求文本。鉴权失败：延迟 1s 后返回 400。
 pub async fn handle_jsonrpc(state: &AppState, body: &str) -> RpcHttpResponse {
     let req = match protocol::parse_request(body) {
@@ -90,43 +125,15 @@ pub async fn handle_jsonrpc(state: &AppState, body: &str) -> RpcHttpResponse {
     }
 
     let params: Vec<Value> = req.params.as_array().cloned().unwrap_or_default();
-
-    if needs_auth(&req.method) && !check_token(&state.secret, &params) {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        return RpcHttpResponse {
-            status: StatusCode::BAD_REQUEST,
-            body: make_out(id, None, 1, "身份认证失败").to_text(),
-        };
-    }
-
-    // 剥离 params[0] 中的 token（aria2 约定）
-    let params: Vec<Value> = params
-        .into_iter()
-        .filter(|p| !p.as_str().map(|s| s.starts_with("token:")).unwrap_or(false))
-        .collect();
-
-    let ctx = MethodCtx {
-        mgr: &state.mgr,
-        global: &state.global,
-        session_id: &state.session_id,
-        shutdown: &state.shutdown,
-        secret: &state.secret,
-        config: state.config.as_deref(),
+    let out = match authorize_and_dispatch(state, &req.method, params, id).await {
+        Ok(out) => out,
+        Err(out) => {
+            return RpcHttpResponse {
+                status: StatusCode::BAD_REQUEST,
+                body: out.to_text(),
+            };
+        }
     };
-
-    let out = match dispatch(ctx, &req.method, &params).await {
-        Ok(v) => RpcOut::Response {
-            id: id.clone(),
-            result: Some(v),
-            error: None,
-        },
-        Err((code, message)) => RpcOut::Response {
-            id,
-            result: None,
-            error: Some(super::protocol::RpcErrorBody { code, message }),
-        },
-    };
-
     RpcHttpResponse {
         status: StatusCode::OK,
         body: out.to_text(),
@@ -223,41 +230,15 @@ async fn get_handler(
     };
     let id = q.id.clone();
 
-    if needs_auth(&q.method) && !check_token(&state.secret, &params) {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let out = make_out(id, None, 1, "身份认证失败");
-        return RpcHttpResponse {
-            status: StatusCode::BAD_REQUEST,
-            body: wrap(out.to_text()),
+    let out = match authorize_and_dispatch(&state, &q.method, params, id).await {
+        Ok(out) => out,
+        Err(out) => {
+            return RpcHttpResponse {
+                status: StatusCode::BAD_REQUEST,
+                body: wrap(out.to_text()),
+            }
+            .into_response();
         }
-        .into_response();
-    }
-
-    // 剥离 token
-    let params: Vec<Value> = params
-        .into_iter()
-        .filter(|p| !p.as_str().map(|s| s.starts_with("token:")).unwrap_or(false))
-        .collect();
-
-    let ctx = MethodCtx {
-        mgr: &state.mgr,
-        global: &state.global,
-        session_id: &state.session_id,
-        shutdown: &state.shutdown,
-        secret: &state.secret,
-        config: state.config.as_deref(),
-    };
-    let out = match dispatch(ctx, &q.method, &params).await {
-        Ok(v) => RpcOut::Response {
-            id,
-            result: Some(v),
-            error: None,
-        },
-        Err((code, message)) => RpcOut::Response {
-            id,
-            result: None,
-            error: Some(super::protocol::RpcErrorBody { code, message }),
-        },
     };
     RpcHttpResponse {
         status: StatusCode::OK,

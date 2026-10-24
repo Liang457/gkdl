@@ -1,7 +1,7 @@
 use crate::download::config::DownloadConfig;
 use crate::download::curl::{curl_error_text, CurlMsg, HttpClient};
 use crate::download::rate_limit::TokenBucket;
-use crate::download::scheduler::WorkStealingScheduler;
+use crate::download::scheduler::{FailureAction, WorkStealingScheduler};
 use crate::download::segment::Segment;
 use crate::download::source::{Source, SourceManager};
 use crate::download::writer::DownloadWriter;
@@ -609,8 +609,6 @@ impl DownloadWorker {
         }
     }
 }
-
-use crate::download::scheduler::FailureAction;
 
 #[cfg(test)]
 mod tests {

@@ -194,11 +194,7 @@ pub struct TaskManager {
 }
 
 impl TaskManager {
-    pub fn new(
-        hook: HookConfig,
-        _default_config: DownloadConfig,
-        db: Option<Arc<StateDb>>,
-    ) -> Arc<Self> {
+    pub fn new(hook: HookConfig, db: Option<Arc<StateDb>>) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(128);
         Arc::new(Self {
             tasks: RwLock::new(HashMap::new()),
@@ -592,6 +588,13 @@ impl TaskManager {
 
     pub async fn pause(&self, gid: &str) -> Result<()> {
         let task = self.get(gid).ok_or_else(|| anyhow!("GID {} 不存在", gid))?;
+        match task.status() {
+            // 已暂停：幂等返回（排队中/下载中一致）
+            TaskStatus::Paused => return Ok(()),
+            // 终态任务的 driver 已退出，改回 paused 会成为永远无法恢复的僵尸状态
+            TaskStatus::Complete | TaskStatus::Error => bail!("任务已结束，无法暂停"),
+            _ => {}
+        }
         let sched = {
             let guard = task.scheduler.lock().unwrap();
             guard.as_ref().map(Arc::clone)
@@ -599,9 +602,7 @@ impl TaskManager {
         match sched {
             Some(s) => {
                 s.set_paused(true);
-                if task.status() != TaskStatus::Paused {
-                    *task.status.lock().unwrap() = TaskStatus::Paused;
-                }
+                *task.status.lock().unwrap() = TaskStatus::Paused;
                 let _ = self.events.send(TaskEvent::Paused {
                     gid: gid.to_string(),
                 });
@@ -824,11 +825,11 @@ impl TaskManager {
                             .unwrap_or_default();
                         break Err(anyhow!(msg));
                     }
-                    TaskStatus::Removed => break Err(anyhow!("任务已移除")),
                     _ => {}
                 }
             } else {
-                break Err(anyhow!("GID {} 不存在", gid));
+                // remove() 同步把任务移出注册表，查无此 GID 即「已移除」
+                break Err(anyhow!("任务已移除或不存在"));
             }
             match rx.recv().await {
                 Ok(_) => continue,
@@ -882,9 +883,43 @@ mod tests {
         assert!(gid.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
+    #[tokio::test]
+    async fn pause_rejected_on_terminal_state() {
+        // 守护：终态任务的 driver 已退出，pause 不得把它改写成 paused 僵尸状态
+        let mgr = TaskManager::new(HookConfig::default(), None);
+        let out = std::env::temp_dir().join(format!("gkdl_pause_term_{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        // 无效协议 URL：curl 探测立即失败（无网络依赖），任务随即进入 Error
+        let gid = mgr
+            .add_download(
+                vec!["not-a-url://x/f.bin".into()],
+                Some(out.clone()),
+                DownloadConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut status = mgr.get(&gid).unwrap().status();
+        for _ in 0..100 {
+            if status == TaskStatus::Error {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            status = mgr.get(&gid).unwrap().status();
+        }
+        assert_eq!(mgr.get(&gid).unwrap().status(), TaskStatus::Error);
+        assert!(mgr.pause(&gid).await.is_err(), "已结束的任务不得暂停");
+        assert_eq!(
+            mgr.get(&gid).unwrap().status(),
+            TaskStatus::Error,
+            "暂停失败后状态必须保持不变"
+        );
+        std::fs::remove_file(&out).ok();
+    }
+
     #[test]
     fn path_ownership_blocks_stale_cleanup() {
-        let mgr = TaskManager::new(HookConfig::default(), DownloadConfig::default(), None);
+        let mgr = TaskManager::new(HookConfig::default(), None);
         let f = PathBuf::from("C:/dl/f.bin");
         let old = "aaaa000000000001";
         let fresh = "bbbb000000000002";
